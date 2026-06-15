@@ -39,5 +39,11 @@
 	<string>oqLtx5s2hc8Xgsp4rEuTwnQ8UGRT4ma4tjlf+1i3YHA=</string>
 	<key>SUScheduledCheckInterval</key>
 	<integer>14400</integer>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_codeisland._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>CodeIsland advertises itself on the local network so iPhone can mirror the island state.</string>
 </dict>
 </plist>
