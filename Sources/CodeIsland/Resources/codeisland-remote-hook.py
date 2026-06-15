@@ -88,6 +88,20 @@ def _normalize_event(name):
         return "PostCompact"
     if name == "notification":
         return "Notification"
+    # Hermes (Nous Research) — snake_case, diverged from Claude/Gemini (#226).
+    # `subagent_stop` is already handled above.
+    if name == "pre_tool_call":
+        return "PreToolUse"
+    if name == "post_tool_call":
+        return "PostToolUse"
+    if name == "pre_llm_call":
+        return "UserPromptSubmit"
+    if name == "on_session_start":
+        return "SessionStart"
+    if name == "on_session_end":
+        return "SessionEnd"
+    if name == "on_session_reset":
+        return "SessionEnd"
     return name
 
 

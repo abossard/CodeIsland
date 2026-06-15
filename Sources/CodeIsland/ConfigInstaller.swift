@@ -37,6 +37,10 @@ enum HookFormat {
     case none
     /// Cline: per-event executable files in ~/Documents/Cline/Hooks/<EventName>
     case cline
+    /// Hermes (Nous Research) style: YAML managed block in ~/.hermes/config.yaml
+    /// where `hooks:` is a MAP of snake_case event names -> list of
+    /// {matcher?, command, timeout?}. Diverged from Claude — not a fork (#226).
+    case hermes
 
     var storageValue: String {
         switch self {
@@ -49,6 +53,7 @@ enum HookFormat {
         case .kiroAgent: return "kiroAgent"
         case .none: return "none"
         case .cline: return "cline"
+        case .hermes: return "hermes"
         }
     }
 
@@ -63,6 +68,7 @@ enum HookFormat {
         case "kiroagent": self = .kiroAgent
         case "none": self = .none
         case "cline": self = .cline
+        case "hermes": self = .hermes
         default: return nil
         }
     }
@@ -120,6 +126,7 @@ struct ConfigInstaller {
     /// Absolute path for external CLI hooks — avoids tilde expansion issues in IDE environments
     private static let bridgeCommand = codeislandDir + "/codeisland-bridge"
     private static let traecliConfigPath = NSHomeDirectory() + "/.trae/traecli.yaml"
+    private static let hermesConfigPath = NSHomeDirectory() + "/.hermes/config.yaml"
     private static let piAgentDir = NSHomeDirectory() + "/.pi/agent"
     private static let piExtensionDir = NSHomeDirectory() + "/.pi/agent/extensions"
     private static let piExtensionPath = NSHomeDirectory() + "/.pi/agent/extensions/codeisland.ts"
@@ -302,12 +309,15 @@ struct ConfigInstaller {
             format: .claude,
             events: defaultEvents(for: .claude)
         ),
-        // Hermes — Claude Code fork
+        // Hermes (Nous Research) — NOT a Claude Code fork. Reads shell hooks from
+        // ~/.hermes/config.yaml under a `hooks:` map keyed by snake_case event
+        // names. Writing settings.json (the old behavior) meant Hermes never even
+        // parsed the file, so events never fired (#226).
         CLIConfig(
             name: "Hermes", source: "hermes",
-            configPath: ".hermes/settings.json", configKey: "hooks",
-            format: .claude,
-            events: defaultEvents(for: .claude)
+            configPath: ".hermes/config.yaml", configKey: "hooks",
+            format: .hermes,
+            events: defaultEvents(for: .hermes)
         ),
         // Qwen Code — timeout in milliseconds
         CLIConfig(
@@ -490,6 +500,20 @@ struct ConfigInstaller {
                 ("postToolUse", 5, true),
                 ("stop", 5, true),
             ]
+        case .hermes:
+            // Hermes event names (snake_case). Timeouts in seconds (Hermes default
+            // 60, max 300). Keep status events lightweight; do NOT register a
+            // long-timeout blocking permission event — Hermes uses
+            // pre_approval_request/post_approval_response, not a Claude-style
+            // PermissionRequest, so permission/question handling is left out of
+            // v1 (#226).
+            return [
+                ("pre_tool_call", 5, false),
+                ("post_tool_call", 5, false),
+                ("on_session_start", 5, false),
+                ("on_session_end", 5, false),
+                ("subagent_stop", 5, false),
+            ]
         case .cline:
             return []
         case .none:
@@ -637,6 +661,8 @@ struct ConfigInstaller {
                 if !installClaudeHooks(cli: cli, fm: fm) { ok = false }
             } else if cli.source == "traecli" {
                 if !installTraecliHooks(fm: fm) { ok = false }
+            } else if cli.format == .hermes {
+                if !installHermesHooks(fm: fm) { ok = false }
             } else if cli.source == "pi" || cli.source == "omp" {
                 continue
             } else {
@@ -679,6 +705,8 @@ struct ConfigInstaller {
         for cli in allCLIs {
             if cli.source == "traecli" {
                 uninstallTraecliHooks(fm: fm)
+            } else if cli.format == .hermes {
+                uninstallHermesHooks(fm: fm)
             } else if cli.source == "pi" {
                 uninstallPiExtension(fm: fm)
             } else if cli.source == "omp" {
@@ -704,6 +732,7 @@ struct ConfigInstaller {
         if source == "pi" { return isPiExtensionInstalled(fm: FileManager.default) }
         if source == "omp" { return isOmpExtensionInstalled(fm: FileManager.default) }
         if source == "traecli" { return isTraecliHooksInstalled(fm: FileManager.default) }
+        if source == "hermes" { return isHermesHooksInstalled(fm: FileManager.default) }
         if source == "cline" {
             guard let cli = allCLIs.first(where: { $0.source == "cline" }) else { return false }
             return isClineHooksInstalled(cli: cli, fm: FileManager.default)
@@ -759,6 +788,8 @@ struct ConfigInstaller {
                 return installClaudeHooks(cli: cli, fm: fm)
             } else if cli.source == "traecli" {
                 return installTraecliHooks(fm: fm)
+            } else if cli.format == .hermes {
+                return installHermesHooks(fm: fm)
             } else {
                 installExternalHooks(cli: cli, fm: fm)
                 if cli.source == "codex" { enableCodexHooksConfig(fm: fm) }
@@ -774,6 +805,8 @@ struct ConfigInstaller {
             } else if let cli = allCLIs.first(where: { $0.source == source }) {
                 if cli.source == "traecli" {
                     uninstallTraecliHooks(fm: fm)
+                } else if cli.format == .hermes {
+                    uninstallHermesHooks(fm: fm)
                 } else {
                     uninstallHooks(cli: cli, fm: fm)
                 }
@@ -806,6 +839,13 @@ struct ConfigInstaller {
             if cli.source == "traecli" {
                 if isTraecliHooksInstalled(fm: fm) { continue }
                 if installTraecliHooks(fm: fm) {
+                    repaired.append(cli.name)
+                }
+                continue
+            }
+            if cli.format == .hermes {
+                if isHermesHooksInstalled(fm: fm) { continue }
+                if installHermesHooks(fm: fm) {
                     repaired.append(cli.name)
                 }
                 continue
@@ -1143,6 +1183,10 @@ struct ConfigInstaller {
                 entry = ["type": "command", "bash": copilotCommand, "timeoutSec": timeout]
             case .kimi:
                 // Handled earlier in the function; should never reach here
+                return false
+            case .hermes:
+                // Hermes uses a dedicated YAML installer (installHermesHooks);
+                // never reaches the JSON external-hook path.
                 return false
             case .kiroAgent:
                 // Kiro entries: { command, matcher: "*", timeout_ms }. Caller declares
@@ -1700,6 +1744,158 @@ struct ConfigInstaller {
 
         let normalized = contents.replacingOccurrences(of: "\r\n", with: "\n")
         return removeManagedTraecliHooks(from: normalized, source: "traecli") != normalized
+    }
+
+    // MARK: - Hermes config.yaml (#226)
+    //
+    // Hermes (Nous Research) is NOT a Claude Code fork. It reads shell hooks from
+    // ~/.hermes/config.yaml under a `hooks:` MAP whose keys are snake_case event
+    // names and whose values are lists of { matcher?, command, timeout? }. This is
+    // a different shape than TraeCli (a flat list with `type: command` +
+    // `matchers`), so it gets its own Yams-based merge/remove path.
+
+    /// The bridge command we inject for Hermes hooks (path quoted if it has spaces).
+    private static func hermesInjectedCommand() -> String {
+        let quotedBridge = bridgeCommand.contains(" ") ? "\"\(bridgeCommand)\"" : bridgeCommand
+        return "\(quotedBridge) --source hermes"
+    }
+
+    /// Command-identity check that tolerates tilde vs. absolute path and quoting,
+    /// mirroring `isOurTraecliInjectedCommand` but for the Hermes source.
+    private static func isOurHermesInjectedCommand(_ command: String) -> Bool {
+        let normalized = normalizeTraecliCommandForCompare(command)
+        for candidate in expectedTraecliCommandCandidates(source: "hermes") {
+            if normalized == normalizeTraecliCommandForCompare(candidate) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Build the `hooks:` map (event -> [ {command, timeout} ]) merged into any
+    /// existing Hermes hooks map, dropping prior managed entries first.
+    static func mergeHermesHooks(into contents: String) -> String {
+        let normalized = contents.replacingOccurrences(of: "\r\n", with: "\n")
+        let command = hermesInjectedCommand()
+
+        var root: [String: Any] = [:]
+        if !normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let loaded = try? Yams.load(yaml: normalized),
+               let dict = asStringKeyedDict(loaded) {
+                root = dict
+            } else {
+                // Never clobber an unparseable user file.
+                return contents.hasSuffix("\n") ? contents : (contents + "\n")
+            }
+        }
+
+        var hooks: [String: Any] = asStringKeyedDict(root["hooks"] ?? [:]) ?? [:]
+
+        for (event, timeout, _) in defaultEvents(for: .hermes) {
+            var entries: [Any] = (hooks[event] as? [Any]) ?? []
+            entries.removeAll { item in
+                guard let entry = asStringKeyedDict(item),
+                      let cmd = entry["command"] as? String else { return false }
+                return isOurHermesInjectedCommand(cmd)
+            }
+            let managed: [String: Any] = ["command": command, "timeout": timeout]
+            entries.insert(managed, at: 0)
+            hooks[event] = entries
+        }
+
+        root["hooks"] = hooks
+
+        guard var dumped = try? Yams.dump(object: root) else {
+            return contents.hasSuffix("\n") ? contents : (contents + "\n")
+        }
+        if !dumped.hasSuffix("\n") { dumped.append("\n") }
+        return dumped
+    }
+
+    /// Remove only our managed entries from the Hermes hooks map; drop now-empty
+    /// event keys and an emptied `hooks:` map so we don't leave noise behind.
+    static func removeManagedHermesHooks(from contents: String) -> String {
+        let normalized = contents.replacingOccurrences(of: "\r\n", with: "\n")
+        if normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return contents }
+
+        guard let loaded = try? Yams.load(yaml: normalized),
+              var root = asStringKeyedDict(loaded),
+              var hooks = asStringKeyedDict(root["hooks"] ?? [:])
+        else { return contents }
+
+        var didRemove = false
+        for (event, value) in hooks {
+            guard let entries = value as? [Any] else { continue }
+            let cleaned = entries.filter { item in
+                guard let entry = asStringKeyedDict(item),
+                      let cmd = entry["command"] as? String else { return true }
+                if isOurHermesInjectedCommand(cmd) {
+                    didRemove = true
+                    return false
+                }
+                return true
+            }
+            if cleaned.isEmpty {
+                hooks.removeValue(forKey: event)
+            } else {
+                hooks[event] = cleaned
+            }
+        }
+
+        guard didRemove else { return contents }
+
+        if hooks.isEmpty {
+            root.removeValue(forKey: "hooks")
+        } else {
+            root["hooks"] = hooks
+        }
+
+        guard var dumped = try? Yams.dump(object: root) else { return contents }
+        if !dumped.hasSuffix("\n") { dumped.append("\n") }
+        return dumped
+    }
+
+    @discardableResult
+    private static func installHermesHooks(fm: FileManager) -> Bool {
+        let configDir = (hermesConfigPath as NSString).deletingLastPathComponent
+        // Only write when Hermes is actually present on this machine.
+        guard fm.fileExists(atPath: configDir) else { return true }
+
+        var original = ""
+        if fm.fileExists(atPath: hermesConfigPath) {
+            guard let data = fm.contents(atPath: hermesConfigPath) else { return false }
+            // Never clobber existing file contents if decoding fails.
+            guard let decoded = String(data: data, encoding: .utf8) else { return false }
+            original = decoded
+        }
+
+        let merged = mergeHermesHooks(into: original)
+        guard let data = merged.data(using: .utf8) else { return false }
+        do {
+            try data.write(to: URL(fileURLWithPath: hermesConfigPath), options: .atomic)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func uninstallHermesHooks(fm: FileManager) {
+        guard fm.fileExists(atPath: hermesConfigPath),
+              let original = try? String(contentsOfFile: hermesConfigPath, encoding: .utf8)
+        else { return }
+
+        let cleaned = removeManagedHermesHooks(from: original)
+        guard cleaned != original, let data = cleaned.data(using: .utf8) else { return }
+        try? data.write(to: URL(fileURLWithPath: hermesConfigPath), options: .atomic)
+    }
+
+    private static func isHermesHooksInstalled(fm: FileManager) -> Bool {
+        guard fm.fileExists(atPath: hermesConfigPath),
+              let contents = try? String(contentsOfFile: hermesConfigPath, encoding: .utf8)
+        else { return false }
+
+        let normalized = contents.replacingOccurrences(of: "\r\n", with: "\n")
+        return removeManagedHermesHooks(from: normalized) != normalized
     }
 
     // MARK: - Codex config.toml
