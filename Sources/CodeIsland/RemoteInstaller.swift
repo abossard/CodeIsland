@@ -550,34 +550,184 @@ def install_claude():
     write_json(settings_path, data)
     return "Claude ok"
 
+# Hermes (Nous Research) is NOT a Claude Code fork. It reads shell hooks from
+# ~/.hermes/config.yaml under a `hooks:` MAP keyed by snake_case event names whose
+# values are lists of { command, timeout }. settings.json is never parsed (#226).
+HERMES_EVENTS = [
+    ("pre_tool_call", 5),
+    ("post_tool_call", 5),
+    ("on_session_start", 5),
+    ("on_session_end", 5),
+    ("subagent_stop", 5),
+]
+
+def _parse_yaml_scalar(raw):
+    raw = raw.strip()
+    if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
+        return raw[1:-1].replace("''", "'")
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        inner = raw[1:-1]
+        bs = chr(92)
+        return inner.replace(bs + bs, bs).replace(bs + '"', '"')
+    return raw
+
+def _normalize_hook_cmd(c):
+    s = " ".join((c or "").strip().split())
+    if not s:
+        return s
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        if end != -1:
+            first = s[1:end]
+            rest = s[end+1:].strip()
+            s = first + (" " + rest if rest else "")
+    parts = s.split(" ", 1)
+    first = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    if first.startswith("~/"):
+        first = str(home) + "/" + first[2:]
+    return first + (" " + rest if rest else "")
+
+def _merge_hermes_hooks(contents, cmd):
+    # Event-key-aware merge for Hermes' nested `hooks:` MAP. We parse the existing
+    # map into an ordered {event: [item-blocks]} structure, drop our prior managed
+    # entries (matched by command), prepend a fresh managed entry under each of our
+    # status events, then re-emit a single `hooks:` block. This is idempotent and
+    # never produces duplicate event keys (#226).
+    normalized = contents.replace("\\r\\n", "\\n")
+    lines = normalized.split("\\n")
+    target_cmd = _normalize_hook_cmd(cmd)
+
+    def _is_top_level_key(line):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            return False
+        if line != stripped:
+            return False
+        return ":" in stripped
+
+    # Locate a top-level `hooks:` mapping key (empty scalar or block-mapping).
+    hooks_index = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if line != stripped:
+            continue
+        if stripped == "hooks:" or stripped.startswith("hooks:"):
+            tail = stripped[len("hooks:"):].split("#", 1)[0].strip()
+            if tail in ("", "{}", "null", "~"):
+                hooks_index = i
+                break
+
+    # Ordered list of (event, [item_blocks]); item_block is a list of raw lines
+    # for one `- ...` list entry, re-indented to 4 spaces on emit.
+    order = []
+    events = {}
+
+    def _ensure_event(ev):
+        if ev not in events:
+            events[ev] = []
+            order.append(ev)
+
+    head_lines = []
+    tail_lines = []
+    if hooks_index is not None:
+        head_lines = lines[:hooks_index]
+        j = hooks_index + 1
+        current_event = None
+        while j < len(lines):
+            line = lines[j]
+            stripped = line.strip()
+            if stripped and _is_top_level_key(line):
+                break  # left the hooks: block
+            if stripped == "" or stripped.startswith("#"):
+                j += 1
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            # An event sub-key like "  pre_tool_call:".
+            if not stripped.startswith("- ") and stripped.endswith(":") and indent >= 1:
+                current_event = stripped[:-1].strip()
+                _ensure_event(current_event)
+                j += 1
+                continue
+            # A list item under the current event.
+            if stripped.startswith("- ") and current_event is not None:
+                item_indent = indent
+                k = j + 1
+                while k < len(lines):
+                    nxt = lines[k]
+                    nxt_stripped = nxt.strip()
+                    nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+                    if nxt_stripped == "":
+                        k += 1
+                        continue
+                    if nxt_indent <= item_indent:
+                        break
+                    k += 1
+                raw_block = [bl for bl in lines[j:k] if bl.strip() != ""]
+                cmd_value = None
+                for bl in raw_block:
+                    bstr = bl.strip()
+                    key = bstr[2:].strip() if bstr.startswith("- ") else bstr
+                    if key.startswith("command:"):
+                        cmd_value = _parse_yaml_scalar(key.split(":", 1)[1])
+                        break
+                # Re-indent the user item to a canonical 4-space list indent so it
+                # composes with our managed entries (avoids mixed-indent YAML).
+                base = min(len(bl) - len(bl.lstrip(" ")) for bl in raw_block)
+                block = []
+                for bl in raw_block:
+                    cur = len(bl) - len(bl.lstrip(" "))
+                    block.append(" " * (4 + (cur - base)) + bl.lstrip(" "))
+                # Drop our prior managed entries; keep user entries.
+                if not (cmd_value is not None and _normalize_hook_cmd(cmd_value) == target_cmd):
+                    events[current_event].append(block)
+                j = k
+                continue
+            j += 1
+        tail_lines = lines[j:]
+    else:
+        head_lines = list(lines)
+        while head_lines and head_lines[-1] == "":
+            head_lines.pop()
+
+    # Prepend our managed entry under each status event.
+    escaped = cmd.replace("'", "''")
+    for (event, timeout) in HERMES_EVENTS:
+        _ensure_event(event)
+        managed_item = [
+            f"    - command: '{escaped}'",
+            f"      timeout: {timeout}",
+        ]
+        events[event].insert(0, managed_item)
+
+    out = list(head_lines)
+    if out and out[-1].strip() != "":
+        out.append("")
+    out.append("hooks:")
+    for event in order:
+        out.append(f"  {event}:")
+        for block in events[event]:
+            out.extend(block)
+    out.extend(tail_lines)
+
+    merged = "\\n".join(out)
+    if not merged.endswith("\\n"):
+        merged += "\\n"
+    return merged
+
 def install_hermes():
-    # Hermes is a Claude Code fork: same settings.json + hooks layout.
     hermes_root = home / ".hermes"
     if not hermes_root.exists() and shutil.which("hermes") is None:
         return "Hermes skipped"
 
-    settings_path = hermes_root / "settings.json"
-    data = ensure_json(settings_path)
-    hooks = data.get("hooks") or {}
-    remove_our_hooks(hooks)
-
+    config_path = hermes_root / "config.yaml"
+    try:
+        original = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    except Exception:
+        return "Hermes read failed"
     cmd = command_for("hermes")
-    without_matcher = [{"hooks": [{"type": "command", "command": cmd, "timeout": 60}]}]
-    with_matcher = [{"matcher": "*", "hooks": [{"type": "command", "command": cmd, "timeout": 60}]}]
-    with_long_timeout = [{"matcher": "*", "hooks": [{"type": "command", "command": cmd, "timeout": 86400}]}]
-    precompact = [
-        {"matcher": "auto", "hooks": [{"type": "command", "command": cmd, "timeout": 60}]},
-        {"matcher": "manual", "hooks": [{"type": "command", "command": cmd, "timeout": 60}]},
-    ]
-    hooks["UserPromptSubmit"] = without_matcher
-    hooks["PermissionRequest"] = with_long_timeout
-    hooks["Notification"] = with_matcher
-    hooks["Stop"] = without_matcher
-    hooks["SessionStart"] = without_matcher
-    hooks["SessionEnd"] = without_matcher
-    hooks["PreCompact"] = precompact
-    data["hooks"] = hooks
-    write_json(settings_path, data)
+    merged = _merge_hermes_hooks(original, cmd)
+    write_text_atomic(config_path, merged)
     return "Hermes ok"
 
 def ensure_toml_codex_hooks(path):

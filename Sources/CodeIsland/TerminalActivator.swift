@@ -130,6 +130,26 @@ struct TerminalActivator {
         }
         let lower = termApp.lowercased()
 
+        // --- Superset (Electron agent-orchestration terminal): app-level activation ---
+        // Must come before the kitty/cmux/iTerm branches. Superset spoofs TERM_PROGRAM to
+        // "kitty" (so claude-code parses CSI-u keyboard input) and strips __CFBundleIdentifier
+        // from the PTY env, so without this the loose `lower.contains("kitty")` branch would
+        // launch/raise the REAL kitty app instead. Superset is a single-window Electron app with
+        // internal xterm.js panes and ships no focus/activate CLI or AppleScript dictionary, so
+        // pane precision is impossible upstream — we can only bring the Superset window forward
+        // (same app-level behavior as Warp / Alacritty fallback). The presence of any SUPERSET_*
+        // env var (captured into supersetWorkspaceId / supersetPaneId) uniquely identifies it.
+        // __CFBundleIdentifier is stripped so we can't tell canary from stable; default to the
+        // stable bundle and fall back to whichever variant is actually running. (#213)
+        if session.supersetWorkspaceId != nil || session.supersetPaneId != nil {
+            let supersetBundles = ["com.superset.desktop", "com.superset.desktop.canary"]
+            let runningBundle = supersetBundles.first(where: { bid in
+                NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == bid })
+            })
+            activateByBundleId(runningBundle ?? "com.superset.desktop")
+            return
+        }
+
         // --- Zellij multiplexer: precise pane → tab focus, then activate parent terminal ---
         // Must come before tmux/cmux/iTerm/Ghostty branches: Zellij runs *inside* one of
         // those terminals, so termApp/termBundleId points to the host shell. The presence

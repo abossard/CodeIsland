@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.27</string>
+	<string>1.0.28</string>
 	<key>CFBundleVersion</key>
-	<string>1.0.27</string>
+	<string>1.0.28</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
@@ -39,5 +39,11 @@
 	<string>oqLtx5s2hc8Xgsp4rEuTwnQ8UGRT4ma4tjlf+1i3YHA=</string>
 	<key>SUScheduledCheckInterval</key>
 	<integer>14400</integer>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_codeisland._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>CodeIsland advertises itself on the local network so iPhone can mirror the island state.</string>
 </dict>
 </plist>

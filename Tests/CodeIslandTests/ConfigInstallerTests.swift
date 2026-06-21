@@ -682,6 +682,140 @@ hooks:
         XCTAssertEqual(cleaned, original)
     }
 
+    // MARK: - Hermes (#226)
+
+    /// Hermes `hooks:` is a MAP of event -> [ {command, timeout} ], not a list.
+    private func hermesHooksMap(_ yaml: String, file: StaticString = #filePath, line: UInt = #line) throws -> [String: [[String: Any]]] {
+        let root = try yamlRootDict(yaml, file: file, line: line)
+        let hooksAny = try XCTUnwrap(root["hooks"], file: file, line: line)
+        guard let map = hooksAny as? [String: Any] else {
+            // Yams may surface a [AnyHashable: Any]
+            if let m = hooksAny as? [AnyHashable: Any] {
+                var out: [String: [[String: Any]]] = [:]
+                for (k, v) in m {
+                    guard let ks = k as? String, let arr = v as? [Any] else { continue }
+                    out[ks] = arr.compactMap { $0 as? [String: Any] }
+                }
+                return out
+            }
+            XCTFail("hooks is not a mapping", file: file, line: line)
+            return [:]
+        }
+        var out: [String: [[String: Any]]] = [:]
+        for (k, v) in map {
+            guard let arr = v as? [Any] else { continue }
+            out[k] = arr.compactMap { $0 as? [String: Any] }
+        }
+        return out
+    }
+
+    func testMergeHermesHooksAppendsMapWhenMissing() throws {
+        let original = "model: hermes-4\n"
+
+        let merged = ConfigInstaller.mergeHermesHooks(into: original)
+
+        // User key preserved.
+        XCTAssertTrue(merged.contains("model: hermes-4"))
+
+        let hooks = try hermesHooksMap(merged)
+        // All five status events registered under snake_case keys.
+        for event in ["pre_tool_call", "post_tool_call", "on_session_start", "on_session_end", "subagent_stop"] {
+            let entries = try XCTUnwrap(hooks[event], "missing event \(event)")
+            let cmd = entries.first?["command"] as? String
+            XCTAssertTrue(cmd?.contains("codeisland-bridge --source hermes") ?? false,
+                          "event \(event) command was \(String(describing: cmd))")
+            // Timeout is a plain int (seconds), <= Hermes max of 300.
+            let timeout = entries.first?["timeout"] as? Int
+            XCTAssertNotNil(timeout)
+            XCTAssertLessThanOrEqual(timeout ?? 999, 300)
+        }
+        // Must NOT use Claude-style settings.json shape (no nested "hooks"/"matcher").
+        XCTAssertFalse(merged.contains("PermissionRequest"))
+        XCTAssertFalse(merged.contains("UserPromptSubmit"))
+    }
+
+    func testMergeHermesHooksIsIdempotent() throws {
+        let once = ConfigInstaller.mergeHermesHooks(into: "")
+        let twice = ConfigInstaller.mergeHermesHooks(into: once)
+        let hooks = try hermesHooksMap(twice)
+        // Re-running must not duplicate our managed entry.
+        let entries = try XCTUnwrap(hooks["pre_tool_call"])
+        let ours = entries.filter { ($0["command"] as? String)?.contains("--source hermes") ?? false }
+        XCTAssertEqual(ours.count, 1)
+    }
+
+    func testMergeHermesHooksPreservesUserHooksAndDropsStaleManaged() throws {
+        let bridge = "\(NSHomeDirectory())/.codeisland/codeisland-bridge"
+        let original = """
+        hooks:
+          pre_tool_call:
+            - command: 'echo user-hook'
+              timeout: 10
+            - command: '\(bridge) --source hermes'
+              timeout: 5
+        hooks_auto_accept: false
+        """
+
+        let merged = ConfigInstaller.mergeHermesHooks(into: original)
+
+        let hooks = try hermesHooksMap(merged)
+        let preTool = try XCTUnwrap(hooks["pre_tool_call"])
+        let commands = preTool.compactMap { $0["command"] as? String }
+        // User hook preserved.
+        XCTAssertTrue(commands.contains("echo user-hook"))
+        // Exactly one of our managed entries (the stale one was replaced, not duplicated).
+        XCTAssertEqual(commands.filter { $0.contains("codeisland-bridge") && $0.contains("--source hermes") }.count, 1)
+        // Sibling user key preserved.
+        XCTAssertEqual(try yamlRootDict(merged)["hooks_auto_accept"] as? Bool, false)
+    }
+
+    func testRemoveManagedHermesHooksDropsOnlyOurEntries() throws {
+        let bridge = "\(NSHomeDirectory())/.codeisland/codeisland-bridge"
+        let original = """
+        hooks:
+          pre_tool_call:
+            - command: 'echo user-hook'
+              timeout: 10
+            - command: '\(bridge) --source hermes'
+              timeout: 5
+          on_session_start:
+            - command: '\(bridge) --source hermes'
+              timeout: 5
+        """
+
+        let cleaned = ConfigInstaller.removeManagedHermesHooks(from: original)
+
+        XCTAssertFalse(cleaned.contains("codeisland-bridge --source hermes"))
+        XCTAssertTrue(cleaned.contains("echo user-hook"))
+        // on_session_start had only our entry — that event key is dropped entirely.
+        let hooks = try? hermesHooksMap(cleaned)
+        XCTAssertNil(hooks?["on_session_start"])
+    }
+
+    func testRemoveManagedHermesHooksLeavesUnrelatedConfigUntouched() {
+        let original = "hooks:\n  pre_tool_call:\n    - command: 'echo user-hook'\n      timeout: 10\n"
+        let cleaned = ConfigInstaller.removeManagedHermesHooks(from: original)
+        // Nothing of ours present -> unchanged.
+        XCTAssertEqual(cleaned, original)
+    }
+
+    func testRemoteInstallerConfigureScriptInstallsHermesAsYaml() {
+        // #226: remote install must write ~/.hermes/config.yaml (YAML), NOT settings.json.
+        let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
+        let script = RemoteInstaller.configureRemoteHooksScript(host: host)
+
+        XCTAssertTrue(script.contains("def install_hermes():"))
+        XCTAssertTrue(script.contains(#"hermes_root / "config.yaml""#))
+        XCTAssertTrue(script.contains("HERMES_EVENTS"))
+        XCTAssertTrue(script.contains(#""pre_tool_call""#))
+        XCTAssertTrue(script.contains(#""on_session_start""#))
+        XCTAssertTrue(script.contains("_merge_hermes_hooks"))
+        XCTAssertTrue(script.contains(#""Hermes ok""#))
+        XCTAssertTrue(script.contains("install_hermes()"))
+        // The old Claude-fork settings.json path must be gone.
+        XCTAssertFalse(script.contains(#"hermes_root / "settings.json""#))
+    }
+
     func testRemoteInstallerConfigureScriptDoesNotContainTraecliTypos() {
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
 
@@ -711,7 +845,8 @@ hooks:
     }
 
     func testRemoteInstallerConfigureScriptInstallsHermes() {
-        // #176: Hermes (a Claude Code fork) must be configured on remote hosts too.
+        // #176/#226: Hermes must be configured on remote hosts via its real YAML
+        // config (~/.hermes/config.yaml), not the old settings.json layout.
         let host = RemoteHost(id: "host-1", name: "devbox", host: "example.com")
 
         let script = RemoteInstaller.configureRemoteHooksScript(host: host)

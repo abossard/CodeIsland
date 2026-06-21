@@ -414,6 +414,11 @@ final class AppState {
         case "codex":      return path.contains("/codex.app/contents/")
         case "opencode":   return path.contains("/opencode.app/contents/")
         case "antigravity": return path.contains("/antigravity.app/contents/")
+        // Google Antigravity IDE — host app is Antigravity.app. Same .app path as
+        // the fork, but the check is per-source so a "google-antigravity" session
+        // (whose host genuinely IS Antigravity.app) never collides with the fork's
+        // "antigravity" CLI sessions (#215).
+        case "google-antigravity": return path.contains("/antigravity.app/contents/")
         case "workbuddy":   return path.contains("/workbuddy.app/contents/")
         case "hermes":      return path.contains("/hermes.app/contents/")
         default:           return false
@@ -639,6 +644,7 @@ final class AppState {
             rotatingSessionId = cachedActiveIds.first
         }
         ESP32StatePublisher.shared.notifyDirty()
+        AppleCompanionPublisher.shared.notifyDirty()
     }
 
     /// Start monitoring the CLI process for a session.
@@ -724,6 +730,7 @@ final class AppState {
         case "stepfun":    return findStepFunPids(candidatePids: candidatePids)
         case "opencode":   return findOpenCodePids(candidatePids: candidatePids)
         case "antigravity": return findAntiGravityPids(candidatePids: candidatePids)
+        case "google-antigravity": return findGoogleAntigravityPids(candidatePids: candidatePids)
         case "workbuddy":  return findWorkBuddyPids(candidatePids: candidatePids)
         case "hermes":     return findHermesPids(candidatePids: candidatePids)
         case "qwen":       return findQwenPids(candidatePids: candidatePids)
@@ -889,6 +896,7 @@ final class AppState {
         if activeSessionCount != summary.activeSessionCount { activeSessionCount = summary.activeSessionCount }
         if totalSessionCount != summary.totalSessionCount { totalSessionCount = summary.totalSessionCount }
         ESP32StatePublisher.shared.notifyDirty()
+        AppleCompanionPublisher.shared.notifyDirty()
     }
 
     private func refreshProviderTitle(for trackedSessionId: String, providerSessionId: String? = nil) {
@@ -941,6 +949,10 @@ final class AppState {
         // correlated, and drain queue entries whose agent already moved on.
         cachePreToolUseIfApplicable(event)
         resolveToolUseIfCompleted(event)
+        // #216: permission requests with no correlatable tool_use_id can't be drained by
+        // resolveToolUseIfCompleted. A follow-up activity event means the user already
+        // approved in the terminal — resume those (and only those) as approved.
+        resolveOrphanPermissionsOnActivity(event)
 
         let effects = reduceEvent(
             sessions: &sessions,
@@ -1136,6 +1148,16 @@ final class AppState {
             responseData = Data(response.utf8)
         } else if always {
             let toolName = pending.event.toolName ?? ""
+            // MCP tools (`mcp__server__tool`) don't accept a rule specifier — the
+            // rule must be the bare tool name. Sending `ruleContent: "*"` makes
+            // Claude Code assemble `mcp__server__tool(*)`, which never matches an
+            // actual MCP call, so the "always allow" rule silently fails to
+            // persist and the same approval keeps re-prompting. Non-MCP tools
+            // (Bash/Read/Edit/…) keep the `*` specifier. (#224)
+            var rule: [String: Any] = ["toolName": toolName]
+            if !toolName.hasPrefix("mcp__") {
+                rule["ruleContent"] = "*"
+            }
             let obj: [String: Any] = [
                 "hookSpecificOutput": [
                     "hookEventName": "PermissionRequest",
@@ -1143,7 +1165,7 @@ final class AppState {
                         "behavior": "allow",
                         "updatedPermissions": [[
                             "type": "addRules",
-                            "rules": [["toolName": toolName, "ruleContent": "*"]],
+                            "rules": [rule],
                             "behavior": "allow",
                             "destination": "session"
                         ]]
@@ -1183,6 +1205,38 @@ final class AppState {
                 log.info("Ignored Buddy skip command because question queue is empty")
             }
         }
+    }
+
+    func answerCompanionQuestion(_ answer: String) {
+        guard !questionQueue.isEmpty else {
+            log.info("Ignored companion question answer because question queue is empty")
+            return
+        }
+
+        if questionQueue[0].isFromPermission,
+           var askState = questionQueue[0].askUserQuestionState {
+            guard let index = askState.items.firstIndex(where: { askState.answers[$0.answerKey] == nil }) else {
+                answerQuestionMulti(askState.items.map {
+                    (question: $0.payload.question, answer: askState.answers[$0.answerKey] ?? "")
+                })
+                return
+            }
+
+            let item = askState.items[index]
+            askState.answers[item.answerKey] = answer
+            questionQueue[0].askUserQuestionState = askState
+
+            if askState.canConfirm {
+                answerQuestionMulti(askState.items.map {
+                    (question: $0.payload.question, answer: askState.answers[$0.answerKey] ?? "")
+                })
+            } else {
+                refreshDerivedState()
+            }
+            return
+        }
+
+        answerQuestion(answer)
     }
 
     /// Find an existing session whose source matches and whose CLI PID equals
@@ -1417,8 +1471,22 @@ final class AppState {
 
     func answerQuestion(_ answer: String) {
         guard !questionQueue.isEmpty else { return }
-        // AskUserQuestion uses batch wizard — direct single answers are not processed
-        if questionQueue[0].isFromPermission, questionQueue[0].askUserQuestionState != nil {
+        // Multi-question wizards (AskUserQuestion, Codex app-server) use the batch
+        // path — direct single answers are not processed.
+        if questionQueue[0].askUserQuestionState != nil,
+           (questionQueue[0].isFromPermission || questionQueue[0].isCodexAppServer) {
+            return
+        }
+        // Codex app-server questions reply over the JSON-RPC client, not a hook.
+        if questionQueue[0].isCodexAppServer {
+            let pending = questionQueue.removeFirst()
+            let answerKey = pending.askUserQuestionState?.items.first?.answerKey
+                ?? pending.question.header ?? "answer"
+            pending.resolveCodexAppServer([answerKey: [answer]])
+            let sessionId = pending.event.sessionId ?? "default"
+            sessions[sessionId]?.status = .processing
+            showNextPending()
+            refreshDerivedState()
             return
         }
         let pending = questionQueue.removeFirst()
@@ -1450,7 +1518,7 @@ final class AppState {
             ]
             responseData = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
         }
-        pending.continuation.resume(returning: responseData)
+        pending.resolution.resumeHook(returning: responseData)
         let sessionId = pending.event.sessionId ?? "default"
         sessions[sessionId]?.status = .processing
 
@@ -1460,6 +1528,26 @@ final class AppState {
 
     func answerQuestionMulti(_ answers: [(question: String, answer: String)]) {
         guard !questionQueue.isEmpty else { return }
+        // Codex app-server questions reply over the JSON-RPC client, not a hook.
+        if questionQueue[0].isCodexAppServer {
+            let pending = questionQueue.removeFirst()
+            var answersByKey: [String: [String]] = [:]
+            if let askState = pending.askUserQuestionState {
+                // Match by position — the wizard collects answers in item order.
+                for (index, item) in askState.items.enumerated() where index < answers.count {
+                    answersByKey[item.answerKey] = [answers[index].answer]
+                }
+            } else {
+                let answerKey = pending.question.header ?? "answer"
+                answersByKey[answerKey] = [answers.first?.answer ?? ""]
+            }
+            pending.resolveCodexAppServer(answersByKey)
+            let sessionId = pending.event.sessionId ?? "default"
+            sessions[sessionId]?.status = .processing
+            showNextPending()
+            refreshDerivedState()
+            return
+        }
         let pending = questionQueue.removeFirst()
         let responseData: Data
         if pending.isFromPermission {
@@ -1500,7 +1588,7 @@ final class AppState {
             ]
             responseData = (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
         }
-        pending.continuation.resume(returning: responseData)
+        pending.resolution.resumeHook(returning: responseData)
         let sessionId = pending.event.sessionId ?? "default"
         sessions[sessionId]?.status = .processing
 
@@ -1531,13 +1619,19 @@ final class AppState {
     func skipQuestion() {
         guard !questionQueue.isEmpty else { return }
         let pending = questionQueue.removeFirst()
-        let responseData: Data
-        if pending.isFromPermission {
-            responseData = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8)
+        if pending.isCodexAppServer {
+            // No "skip" verb in the Codex protocol — abandon the request so the
+            // server stops waiting (it will re-prompt or fall back to its TUI).
+            pending.resolveCodexAppServer(nil)
         } else {
-            responseData = Data(#"{"hookSpecificOutput":{"hookEventName":"Notification"}}"#.utf8)
+            let responseData: Data
+            if pending.isFromPermission {
+                responseData = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8)
+            } else {
+                responseData = Data(#"{"hookSpecificOutput":{"hookEventName":"Notification"}}"#.utf8)
+            }
+            pending.resolution.resumeHook(returning: responseData)
         }
-        pending.continuation.resume(returning: responseData)
         let sessionId = pending.event.sessionId ?? "default"
         sessions[sessionId]?.status = .processing
 
@@ -1580,13 +1674,16 @@ final class AppState {
     private func drainQuestions(forSession sessionId: String, reason: String = "unknown") {
         questionQueue.removeAll { item in
             guard item.event.sessionId == sessionId else { return false }
-            if item.isFromPermission {
+            if item.isCodexAppServer {
+                // Abandon the Codex app-server request so the server stops waiting.
+                item.resolveCodexAppServer(nil)
+            } else if item.isFromPermission {
                 log.notice("⚠️ permission deny reason=drainQuestions(\(reason, privacy: .public)) session=\(sessionId, privacy: .public) tool=AskUserQuestion")
                 let denyData = Data(
                     #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8)
-                item.continuation.resume(returning: denyData)
+                item.resolution.resumeHook(returning: denyData)
             } else {
-                item.continuation.resume(returning: Data("{}".utf8))
+                item.resolution.resumeHook(returning: Data("{}".utf8))
             }
             return true
         }
@@ -2971,6 +3068,27 @@ final class AppState {
         )
     }
 
+    /// Google Antigravity (Gemini-based IDE/CLI, #215). The actionable agent is the
+    /// `agy` CLI (pypi google-antigravity) launched from the IDE's integrated
+    /// terminal; the IDE itself is Antigravity.app (com.google.antigravity).
+    /// We match the IDE app *only* via the Google-specific .app path component to
+    /// avoid colliding with the existing "antigravity" Claude-fork CLI (which lives
+    /// under ~/.antigravity, never in an .app named exactly "antigravity").
+    private nonisolated static func findGoogleAntigravityPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
+        findPids(
+            matchingPathSubstrings: [
+                "/antigravity.app/contents/macos/",
+                "/bin/agy",
+            ],
+            argSubstrings: [
+                "/google-antigravity/",
+                "/antigravity-cli/",
+                "/bin/agy",
+            ],
+            candidatePids: candidatePids
+        )
+    }
+
     private nonisolated static func findWorkBuddyPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
         findPids(
             matchingPathSubstrings: [
@@ -3032,10 +3150,14 @@ final class AppState {
         findPids(
             matchingPathSubstrings: [
                 "/pi-coding-agent/",
+                "/.local/bin/pi",
+                "/.local/bin/omp",
                 "/bin/pi",
+                "/bin/omp",
             ],
             argSubstrings: [
                 "pi-coding-agent",
+                "/.local/bin/omp",
             ],
             candidatePids: candidatePids
         )

@@ -27,6 +27,7 @@ public struct SessionSnapshot: Sendable {
         "stepfun",
         "opencode",
         "antigravity",
+        "google-antigravity",
         "workbuddy",
         "hermes",
         "qwen",
@@ -42,6 +43,29 @@ public struct SessionSnapshot: Sendable {
         "traecn",
         "codebuddy",
         "codybuddycn",
+    ]
+
+    /// Desktop-IDE *host* sources. Their GUI host/helper processes (e.g.
+    /// "Cursor Helper", "Trae Helper", the IDE's own `.../MacOS/<App>` binary)
+    /// appear in the process ancestry of ANY CLI agent launched from that IDE's
+    /// integrated terminal, and would be greedily matched by the loose
+    /// `/<source>` substring rule in `CLIProcessResolver.sourceMatchesExecutablePath`.
+    /// These must never be recovered via ancestry inference: a desktop IDE always
+    /// reports itself explicitly through `--source`, or is detected via its
+    /// dedicated `-cli` variant (`cursor-cli`, `qoder-cli`, `traecli`). Excluding
+    /// them keeps e.g. Claude Code run inside Cursor's terminal — whose `claude`
+    /// process is a source-less Node binary — from being mis-attributed to
+    /// "cursor". (#220)
+    public static let ideHostSources: Set<String> = [
+        "cursor",
+        "trae",
+        "traecn",
+        "qoder",
+        "codebuddy",
+        "codybuddycn",
+        "stepfun",
+        "antigravity",
+        "google-antigravity",
     ]
 
     public var status: AgentStatus = .idle
@@ -78,6 +102,8 @@ public struct SessionSnapshot: Sendable {
     public var zellijPaneId: String?    // Zellij pane id (numeric string) from ZELLIJ_PANE_ID env var
     public var zellijSessionName: String? // Zellij session name from ZELLIJ_SESSION_NAME env var
     public var weztermPaneId: String?   // WezTerm / Kaku pane id (numeric string) from WEZTERM_PANE env var
+    public var supersetWorkspaceId: String? // Superset workspace UUID (from SUPERSET_WORKSPACE_ID env var); presence means running inside Superset
+    public var supersetPaneId: String?  // Superset pane/terminal id (from SUPERSET_PANE_ID / SUPERSET_TERMINAL_ID env var)
     public var cliPid: pid_t?            // CLI process PID (from bridge _ppid)
     public var cliStartTime: Date?       // Start time of the tracked CLI PID (guards PID reuse)
     public var source: String = "claude" // "claude" or "codex"
@@ -108,6 +134,17 @@ public struct SessionSnapshot: Sendable {
             "ag": "antigravity",
             "anti-gravity": "antigravity",
             "anti gravity": "antigravity",
+            // Google Antigravity (Gemini-based IDE/CLI). A SEPARATE product from
+            // the "antigravity" Claude-Code fork above — it reads
+            // ~/.gemini/config/hooks.json, not .antigravity/settings.json. Keep
+            // the "ag"/"anti-gravity" aliases pointed at the fork; only these
+            // explicit google-prefixed / -ide variants resolve here (#215).
+            "googleantigravity": "google-antigravity",
+            "google antigravity": "google-antigravity",
+            "google-anti-gravity": "google-antigravity",
+            "antigravity-ide": "google-antigravity",
+            "antigravity-cli": "google-antigravity",
+            "agy": "google-antigravity",
             "work-buddy": "workbuddy",
             "work body": "workbuddy",
             "work-body": "workbuddy",
@@ -134,11 +171,18 @@ public struct SessionSnapshot: Sendable {
             "trae_cn": "traecn",
             "trae cn": "traecn",
             "traecli": "traecli",
+            "omp": "pi",
+            "oh-my-pi": "pi",
+            "oh my pi": "pi",
         ]
         let canonical = aliases[normalized] ?? normalized
         let dynamicSupportedSources = supportedSources.union(loadCustomSources())
 
         if dynamicSupportedSources.contains(canonical) { return canonical }
+        // Match Google Antigravity variants BEFORE the bare "antigravity" prefix
+        // clause below, so a "google-antigravity-*" sub-brand never falls through
+        // to the Claude-fork source.
+        if canonical.hasPrefix("google-antigravity") || canonical.hasPrefix("googleantigravity") { return "google-antigravity" }
         if canonical.hasPrefix("antigravity") { return "antigravity" }
         if canonical.hasPrefix("workbuddy") { return "workbuddy" }
         if canonical.hasPrefix("hermes") { return "hermes" }
@@ -295,11 +339,12 @@ public struct SessionSnapshot: Sendable {
         case "stepfun": return "StepFun"
         case "opencode": return "OpenCode"
         case "antigravity": return "AntiGravity"
+        case "google-antigravity": return "Google Antigravity"
         case "workbuddy": return "WorkBuddy"
         case "hermes": return "Hermes"
         case "qwen": return "Qwen Code"
         case "kimi": return "Kimi Code CLI"
-        case "pi": return "pi"
+        case "pi": return "Pi"
         case "kiro": return "Kiro"
         case "cline": return "Cline"
         default:
@@ -352,6 +397,7 @@ public struct SessionSnapshot: Sendable {
         "com.stepfun.app": "StepFun",
         "com.openai.codex": "Codex",
         "ai.opencode.desktop": "OpenCode",
+        "com.google.antigravity": "Antigravity",
     ]
 
     /// Maps native app bundle IDs to their expected source identifier.
@@ -366,6 +412,9 @@ public struct SessionSnapshot: Sendable {
         "com.stepfun.app": "stepfun",
         "com.openai.codex": "codex",
         "ai.opencode.desktop": "opencode",
+        // Google Antigravity IDE — its integrated terminal launches the agy CLI,
+        // whose hooks report --source google-antigravity (#215).
+        "com.google.antigravity": "google-antigravity",
     ]
 
     /// Short terminal/app name for display tag
@@ -409,6 +458,10 @@ public struct SessionSnapshot: Sendable {
             if lower.contains("android.studio") { return "Android Studio" }
             if lower.contains("antigravity") { return "Antigravity" }
         }
+        // Superset spoofs TERM_PROGRAM to "kitty" and strips __CFBundleIdentifier, so the only
+        // way to label it correctly is its own SUPERSET_* env vars. Check before the TERM_PROGRAM
+        // fallback below, otherwise it would mislabel as "Kitty". (#213)
+        if supersetWorkspaceId != nil || supersetPaneId != nil { return "Superset" }
         // Fallback to TERM_PROGRAM
         guard let app = termApp else { return nil }
         let lower = app.lowercased()
@@ -774,6 +827,15 @@ public func reduceEvent(
         if let weztermPane = event.rawJSON["_wezterm_pane"] as? String, !weztermPane.isEmpty {
             sessions[sessionId]?.weztermPaneId = weztermPane
         }
+        if let supersetWs = event.rawJSON["_superset_workspace_id"] as? String, !supersetWs.isEmpty {
+            sessions[sessionId]?.supersetWorkspaceId = supersetWs
+        }
+        if let supersetPane = event.rawJSON["_superset_pane_id"] as? String, !supersetPane.isEmpty {
+            sessions[sessionId]?.supersetPaneId = supersetPane
+        }
+        if let env = event.rawJSON["_env"] as? [String: String] {
+            applyEnvMetadata(into: &sessions, sessionId: sessionId, env: env)
+        }
         if let remoteHostId = event.rawJSON["_remote_host_id"] as? String, !remoteHostId.isEmpty {
             sessions[sessionId]?.remoteHostId = remoteHostId
         }
@@ -857,6 +919,65 @@ public func reduceEvent(
 
 // MARK: - Private Helpers
 
+private func applyEnvMetadata(into sessions: inout [String: SessionSnapshot], sessionId: String, env: [String: String]) {
+    if sessions[sessionId]?.termApp == nil,
+       let app = env["TERM_PROGRAM"], !app.isEmpty {
+        sessions[sessionId]?.termApp = app
+    }
+    if sessions[sessionId]?.termBundleId == nil,
+       let bundle = env["__CFBundleIdentifier"], !bundle.isEmpty {
+        sessions[sessionId]?.termBundleId = bundle
+    }
+    if sessions[sessionId]?.itermSessionId == nil,
+       let ses = env["ITERM_SESSION_ID"], !ses.isEmpty {
+        if let colonIdx = ses.firstIndex(of: ":") {
+            sessions[sessionId]?.itermSessionId = String(ses[ses.index(after: colonIdx)...])
+        } else {
+            sessions[sessionId]?.itermSessionId = ses
+        }
+    }
+    if sessions[sessionId]?.kittyWindowId == nil,
+       let kitty = env["KITTY_WINDOW_ID"], !kitty.isEmpty {
+        sessions[sessionId]?.kittyWindowId = kitty
+    }
+    if sessions[sessionId]?.tmuxEnv == nil,
+       let tmux = env["TMUX"], !tmux.isEmpty {
+        sessions[sessionId]?.tmuxEnv = tmux
+    }
+    if sessions[sessionId]?.tmuxPane == nil,
+       let pane = env["TMUX_PANE"], !pane.isEmpty {
+        sessions[sessionId]?.tmuxPane = pane
+    }
+    if sessions[sessionId]?.cmuxSurfaceId == nil,
+       let surface = env["CMUX_SURFACE_ID"], !surface.isEmpty {
+        sessions[sessionId]?.cmuxSurfaceId = surface
+    }
+    if sessions[sessionId]?.cmuxWorkspaceId == nil,
+       let workspace = env["CMUX_WORKSPACE_ID"], !workspace.isEmpty {
+        sessions[sessionId]?.cmuxWorkspaceId = workspace
+    }
+    if sessions[sessionId]?.zellijPaneId == nil,
+       let pane = env["ZELLIJ_PANE_ID"], !pane.isEmpty {
+        sessions[sessionId]?.zellijPaneId = pane
+    }
+    if sessions[sessionId]?.zellijSessionName == nil,
+       let name = env["ZELLIJ_SESSION_NAME"], !name.isEmpty {
+        sessions[sessionId]?.zellijSessionName = name
+    }
+    if sessions[sessionId]?.weztermPaneId == nil,
+       let pane = env["WEZTERM_PANE"], !pane.isEmpty {
+        sessions[sessionId]?.weztermPaneId = pane
+    }
+    if sessions[sessionId]?.supersetWorkspaceId == nil,
+       let workspace = env["SUPERSET_WORKSPACE_ID"], !workspace.isEmpty {
+        sessions[sessionId]?.supersetWorkspaceId = workspace
+    }
+    if sessions[sessionId]?.supersetPaneId == nil,
+       let pane = env["SUPERSET_PANE_ID"] ?? env["SUPERSET_TERMINAL_ID"], !pane.isEmpty {
+        sessions[sessionId]?.supersetPaneId = pane
+    }
+}
+
 public func extractMetadata(into sessions: inout [String: SessionSnapshot], sessionId: String, event: HookEvent) {
     if let cwd = event.rawJSON["cwd"] as? String, !cwd.isEmpty {
         sessions[sessionId]?.cwd = cwd
@@ -911,33 +1032,9 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     if let bundle = event.rawJSON["_term_bundle"] as? String, !bundle.isEmpty {
         sessions[sessionId]?.termBundleId = bundle
     }
-    // Fallback: extract terminal info from _env sub-object (OpenCode plugin format)
+    // Fallback: extract terminal/multiplexer info from _env sub-object (direct plugin format)
     if let env = event.rawJSON["_env"] as? [String: String] {
-        if sessions[sessionId]?.termApp == nil,
-           let app = env["TERM_PROGRAM"], !app.isEmpty {
-            sessions[sessionId]?.termApp = app
-        }
-        if sessions[sessionId]?.termBundleId == nil,
-           let bundle = env["__CFBundleIdentifier"], !bundle.isEmpty {
-            sessions[sessionId]?.termBundleId = bundle
-        }
-        if sessions[sessionId]?.itermSessionId == nil,
-           let ses = env["ITERM_SESSION_ID"], !ses.isEmpty {
-            // Extract GUID after "w0t0p0:" prefix
-            if let colonIdx = ses.firstIndex(of: ":") {
-                sessions[sessionId]?.itermSessionId = String(ses[ses.index(after: colonIdx)...])
-            } else {
-                sessions[sessionId]?.itermSessionId = ses
-            }
-        }
-        if sessions[sessionId]?.kittyWindowId == nil,
-           let kitty = env["KITTY_WINDOW_ID"], !kitty.isEmpty {
-            sessions[sessionId]?.kittyWindowId = kitty
-        }
-        if sessions[sessionId]?.tmuxPane == nil,
-           let pane = env["TMUX_PANE"], !pane.isEmpty {
-            sessions[sessionId]?.tmuxPane = pane
-        }
+        applyEnvMetadata(into: &sessions, sessionId: sessionId, env: env)
     }
     if let ppid = event.rawJSON["_ppid"] as? Int, ppid > 0 {
         sessions[sessionId]?.cliPid = pid_t(ppid)
@@ -963,6 +1060,14 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     // WezTerm / Kaku pane id (injected by bridge from WEZTERM_PANE env var)
     if let weztermPane = event.rawJSON["_wezterm_pane"] as? String, !weztermPane.isEmpty {
         sessions[sessionId]?.weztermPaneId = weztermPane
+    }
+    // Superset workspace / pane (injected by bridge from SUPERSET_* env vars). Presence routes
+    // activation to com.superset.desktop instead of the spoofed kitty TERM_PROGRAM. (#213)
+    if let supersetWs = event.rawJSON["_superset_workspace_id"] as? String, !supersetWs.isEmpty {
+        sessions[sessionId]?.supersetWorkspaceId = supersetWs
+    }
+    if let supersetPane = event.rawJSON["_superset_pane_id"] as? String, !supersetPane.isEmpty {
+        sessions[sessionId]?.supersetPaneId = supersetPane
     }
     if let remoteHostId = event.rawJSON["_remote_host_id"] as? String, !remoteHostId.isEmpty {
         sessions[sessionId]?.remoteHostId = remoteHostId

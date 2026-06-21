@@ -392,6 +392,56 @@ final class AppStatePermissionFlowTests: XCTestCase {
         XCTAssertTrue(rules.contains(#"decision = "allow""#))
     }
 
+    /// #224: "Always allow" for an MCP tool (`mcp__server__tool`) must emit a
+    /// bare-tool-name rule with NO `ruleContent` specifier. Claude Code's MCP
+    /// permission rules don't take a specifier; sending `ruleContent: "*"`
+    /// assembles `mcp__server__tool(*)`, which never matches a real MCP call, so
+    /// the rule silently fails to persist and the same approval re-prompts.
+    func testAlwaysAllowMCPToolOmitsRuleSpecifier() async throws {
+        let appState = AppState()
+        let event = try makePermissionRequestEvent(
+            sessionId: "s-mcp-always",
+            toolName: "mcp__sh_wiki__fetch_page",
+            toolInput: ["page_id": "432458668"]
+        )
+
+        let responseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(event, continuation: continuation)
+            }
+        }
+
+        await Task.yield()
+        appState.approvePermission(always: true)
+
+        let rule = try firstAlwaysAllowRule(from: await responseTask.value)
+        XCTAssertEqual(rule["toolName"] as? String, "mcp__sh_wiki__fetch_page")
+        XCTAssertNil(rule["ruleContent"], "MCP tool rules must not carry a specifier (#224)")
+    }
+
+    /// Non-MCP tools keep the wildcard specifier so "always allow" still applies
+    /// to every future call of that tool. The #224 fix must not change them.
+    func testAlwaysAllowNonMCPToolKeepsWildcardSpecifier() async throws {
+        let appState = AppState()
+        let event = try makePermissionRequestEvent(
+            sessionId: "s-bash-always",
+            toolName: "Bash"
+        )
+
+        let responseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(event, continuation: continuation)
+            }
+        }
+
+        await Task.yield()
+        appState.approvePermission(always: true)
+
+        let rule = try firstAlwaysAllowRule(from: await responseTask.value)
+        XCTAssertEqual(rule["toolName"] as? String, "Bash")
+        XCTAssertEqual(rule["ruleContent"] as? String, "*")
+    }
+
     func testCodexAlwaysAllowDoesNotDuplicateExistingCodeIslandRule() throws {
         let codexHome = makeTemporaryCodexHome()
         defer { try? FileManager.default.removeItem(at: codexHome) }
@@ -534,6 +584,14 @@ final class AppStatePermissionFlowTests: XCTestCase {
         let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: responseData) as? [String: Any])
         let hookSpecificOutput = try XCTUnwrap(json["hookSpecificOutput"] as? [String: Any])
         return try XCTUnwrap(hookSpecificOutput["decision"] as? [String: Any])
+    }
+
+    private func firstAlwaysAllowRule(from responseData: Data) throws -> [String: Any] {
+        let decision = try extractPermissionDecision(from: responseData)
+        let updated = try XCTUnwrap(decision["updatedPermissions"] as? [[String: Any]])
+        let first = try XCTUnwrap(updated.first)
+        let rules = try XCTUnwrap(first["rules"] as? [[String: Any]])
+        return try XCTUnwrap(rules.first)
     }
 
     private func assertTaskNotResolved(_ task: Task<Data, Never>, timeout: TimeInterval = 0.05) async {

@@ -45,6 +45,18 @@ final class DerivedSessionStateTests: XCTestCase {
         XCTAssertEqual(EventNormalizer.normalize("TaskCancel"), "TaskRoundComplete")
     }
 
+    func testNormalizesHermesSnakeCaseEvents() {
+        // #226: Hermes (Nous Research) uses *_call / on_session_* names that diverge
+        // from both Claude and the traecli snake_case set.
+        XCTAssertEqual(EventNormalizer.normalize("pre_tool_call"), "PreToolUse")
+        XCTAssertEqual(EventNormalizer.normalize("post_tool_call"), "PostToolUse")
+        XCTAssertEqual(EventNormalizer.normalize("pre_llm_call"), "UserPromptSubmit")
+        XCTAssertEqual(EventNormalizer.normalize("on_session_start"), "SessionStart")
+        XCTAssertEqual(EventNormalizer.normalize("on_session_end"), "SessionEnd")
+        XCTAssertEqual(EventNormalizer.normalize("on_session_reset"), "SessionEnd")
+        XCTAssertEqual(EventNormalizer.normalize("subagent_stop"), "SubagentStop")
+    }
+
     func testAfterAgentResponseCompletesIDESource() throws {
         var session = SessionSnapshot()
         session.source = "cursor"

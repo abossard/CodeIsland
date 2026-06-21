@@ -640,12 +640,13 @@ private struct IdleIndicatorBar: View {
     let hovered: Bool
     @ObservedObject private var l10n = L10n.shared
     @AppStorage(SettingsKey.soundEnabled) private var soundEnabled = SettingsDefaults.soundEnabled
+    @AppStorage(SettingsKey.defaultSource) private var defaultSource = SettingsDefaults.defaultSource
 
     var body: some View {
         HStack(spacing: 0) {
             // Left: mascot
             HStack(spacing: 6) {
-                MascotView(source: "claude", status: .idle, size: mascotSize)
+                MascotView(source: defaultSource, status: .idle, size: mascotSize)
                     .opacity(hovered ? 0.9 : 0.5)
             }
             .padding(.leading, 6)
@@ -1578,6 +1579,7 @@ private struct SessionListView: View {
                 ("codex", "Codex"),
                 ("gemini", "Gemini"),
                 ("antigravity", "AntiGravity"),
+                ("google-antigravity", "Google Antigravity"),
                 ("cursor", "Cursor"),
                 ("trae", "Trae"),
                 ("traecn", "Trae CN"),
@@ -2556,6 +2558,7 @@ private let cliIconFiles: [String: String] = [
     "codex": "codex",
     "gemini": "gemini",
     "antigravity": "antigravity",
+    "google-antigravity": "gemini",
     "cursor": "cursor",
     "trae": "trae",
     "traecn": "trae",
@@ -2570,6 +2573,7 @@ private let cliIconFiles: [String: String] = [
     "hermes": "hermes",
     "qwen": "qwen",
     "kimi": "kimi",
+    "pi": "pi",
     "opencode": "opencode",
     "cline": "cline",
 ]

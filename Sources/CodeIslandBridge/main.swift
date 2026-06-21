@@ -258,7 +258,18 @@ if json["session_id"] == nil {
     } else if let data = json["data"] as? [String: Any],
               let sessionId = nonEmptyString(data["session_id"]) ?? nonEmptyString(data["sessionId"]) {
         json["session_id"] = sessionId
+    } else if let conversationId = nonEmptyString(json["conversationId"]) {
+        // Google Antigravity (Gemini-based) stdin carries no session_id; it uses
+        // `conversationId` as the stable per-conversation key (#215).
+        json["session_id"] = conversationId
     }
+}
+
+// Google Antigravity sends the transcript path as camelCase `transcriptPath`;
+// the rest of CodeIsland reads snake_case `transcript_path` (used by the JSONL
+// tailer + cwd inference). Bridge the alias when only the camelCase form exists.
+if json["transcript_path"] == nil, let tp = nonEmptyString(json["transcriptPath"]) {
+    json["transcript_path"] = tp
 }
 
 // Copilot CLI adaptation: its stdin JSON lacks session_id and hook_event_name.
@@ -466,6 +477,20 @@ if let zellij = env["ZELLIJ"], !zellij.isEmpty {
 // WezTerm / Kaku pane id — both forks set WEZTERM_PANE; Kaku is a WezTerm fork (bundle id fun.tw93.kaku)
 if let weztermPane = env["WEZTERM_PANE"], !weztermPane.isEmpty {
     json["_wezterm_pane"] = weztermPane
+}
+
+// Superset (Electron agent-orchestration terminal) — TERM_PROGRAM is spoofed to "kitty"
+// and __CFBundleIdentifier is stripped from the PTY env, so the only reliable Superset
+// signal is its own SUPERSET_* env vars (which survive Superset's env allowlist). The mere
+// presence of any SUPERSET_* var uniquely means "running inside Superset"; the activator
+// uses that to route to com.superset.desktop instead of the real kitty app. (#213)
+if let supersetWs = env["SUPERSET_WORKSPACE_ID"], !supersetWs.isEmpty {
+    json["_superset_workspace_id"] = supersetWs
+}
+// Pane / terminal id — captured for future pane-precision if Superset ever ships a focus CLI;
+// either var's presence is also a reliable Superset signal on its own.
+if let supersetPane = env["SUPERSET_PANE_ID"] ?? env["SUPERSET_TERMINAL_ID"], !supersetPane.isEmpty {
+    json["_superset_pane_id"] = supersetPane
 }
 
 // --- Serialize enriched JSON ---
