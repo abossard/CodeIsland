@@ -26,6 +26,10 @@ public enum EventNormalizer {
         case "userPromptSubmitted":   return "UserPromptSubmit"
         case "preToolUse":            return "PreToolUse"
         case "postToolUse":           return "PostToolUse"
+        case "postToolUseFailure":    return "PostToolUseFailure"
+        case "permissionRequest":     return "PermissionRequest"
+        case "notification":          return "Notification"
+        case "agentStop":             return "Stop"
         case "errorOccurred":         return "Notification"
         // Kiro CLI (camelCase, agent-scoped)
         case "agentSpawn":            return "SessionStart"
@@ -42,7 +46,6 @@ public enum EventNormalizer {
         case "subagent_stop":         return "SubagentStop"
         case "pre_compact":           return "PreCompact"
         case "post_compact":          return "PostCompact"
-        case "notification":          return "Notification"
         // Cline (VSCode extension)
         case "TaskStart":             return "SessionStart"
         case "TaskResume":            return "UserPromptSubmit"

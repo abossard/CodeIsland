@@ -126,4 +126,23 @@ final class L10nTests: XCTestCase {
         let formattedUpdate = String(format: updateAvailable, "1.0.19", "1.0.18")
         XCTAssertEqual(formattedUpdate, "CodeIsland 1.0.19 が利用可能です (現在: 1.0.18)。ダウンロードしますか？")
     }
+
+    func testReplyCompletePlaceholderResolvesForAllSupportedLanguages() {
+        let cases = [
+            ("en", "[Reply complete]"),
+            ("zh", "[回复完成]"),
+            ("ja", "[応答完了]"),
+            ("ko", "[응답 완료]"),
+            ("tr", "[Yanıt tamamlandı]"),
+        ]
+
+        for (language, expected) in cases {
+            L10n.shared.language = language
+
+            let value = L10n.shared["reply_complete_placeholder"]
+
+            XCTAssertEqual(value, expected, language)
+            XCTAssertNotEqual(value, "reply_complete_placeholder", language)
+        }
+    }
 }

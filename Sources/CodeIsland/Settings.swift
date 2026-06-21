@@ -16,6 +16,26 @@ enum NotchHeightMode: String, CaseIterable {
     case custom = "custom"
 }
 
+enum CopilotPermissionMode: String, CaseIterable, Identifiable {
+    case intercept
+    case headsUp
+    case off
+
+    var id: String { rawValue }
+}
+
+enum CopilotSubagentMode: String, CaseIterable, Identifiable {
+    case merge
+    case hide
+
+    var id: String { rawValue }
+
+    static func normalizedRawValue(_ rawValue: String?) -> String {
+        guard let rawValue, Self(rawValue: rawValue) != nil else { return Self.merge.rawValue }
+        return rawValue
+    }
+}
+
 enum SettingsKey {
     // Language
     static let appLanguage = "appLanguage"                 // "system", "en", "zh", "ja", "ko", "tr"
@@ -34,6 +54,8 @@ enum SettingsKey {
     static let autoCollapseAfterSessionJump = "autoCollapseAfterSessionJump"
     static let autoExpandOnCompletion = "autoExpandOnCompletion"
     static let pluginSessionMode = "pluginSessionMode"  // "separate" | "merge" | "hide"
+    static let copilotSubagentMode = "copilotSubagentMode"  // "merge" | "hide"
+    static let copilotPermissionMode = "copilotPermissionMode"  // "intercept" | "headsUp" | "off"
     static let hapticOnHover = "hapticOnHover"
     static let hapticIntensity = "hapticIntensity"      // 1=light, 2=medium, 3=strong
     static let sessionTimeout = "sessionTimeout"
@@ -117,6 +139,8 @@ struct SettingsDefaults {
     static let autoCollapseAfterSessionJump = false
     static let autoExpandOnCompletion = true
     static let pluginSessionMode = "separate"
+    static let copilotSubagentMode = CopilotSubagentMode.merge.rawValue
+    static let copilotPermissionMode = CopilotPermissionMode.headsUp.rawValue
     static let hapticOnHover = false
     static let hapticIntensity = 1          // 1=light
     static let sessionTimeout = 30
@@ -190,6 +214,8 @@ class SettingsManager {
             SettingsKey.autoCollapseAfterSessionJump: SettingsDefaults.autoCollapseAfterSessionJump,
             SettingsKey.autoExpandOnCompletion: SettingsDefaults.autoExpandOnCompletion,
             SettingsKey.pluginSessionMode: SettingsDefaults.pluginSessionMode,
+            SettingsKey.copilotSubagentMode: SettingsDefaults.copilotSubagentMode,
+            SettingsKey.copilotPermissionMode: SettingsDefaults.copilotPermissionMode,
             SettingsKey.hapticOnHover: SettingsDefaults.hapticOnHover,
             SettingsKey.hapticIntensity: SettingsDefaults.hapticIntensity,
             SettingsKey.sessionTimeout: SettingsDefaults.sessionTimeout,
@@ -332,6 +358,28 @@ class SettingsManager {
     var sessionGroupingMode: String {
         get { defaults.string(forKey: SettingsKey.sessionGroupingMode) ?? SettingsDefaults.sessionGroupingMode }
         set { defaults.set(newValue, forKey: SettingsKey.sessionGroupingMode) }
+    }
+
+    var copilotPermissionMode: CopilotPermissionMode {
+        get {
+            let raw = defaults.string(forKey: SettingsKey.copilotPermissionMode) ?? SettingsDefaults.copilotPermissionMode
+            return CopilotPermissionMode(rawValue: raw) ?? .headsUp
+        }
+        set { defaults.set(newValue.rawValue, forKey: SettingsKey.copilotPermissionMode) }
+    }
+
+    var copilotSubagentMode: String {
+        get {
+            CopilotSubagentMode.normalizedRawValue(
+                defaults.string(forKey: SettingsKey.copilotSubagentMode)
+            )
+        }
+        set {
+            defaults.set(
+                CopilotSubagentMode.normalizedRawValue(newValue),
+                forKey: SettingsKey.copilotSubagentMode
+            )
+        }
     }
 
     var defaultSource: String {

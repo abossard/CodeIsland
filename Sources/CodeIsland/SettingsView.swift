@@ -349,6 +349,8 @@ private struct BehaviorPage: View {
     @AppStorage(SettingsKey.autoCollapseAfterSessionJump) private var autoCollapseAfterSessionJump = SettingsDefaults.autoCollapseAfterSessionJump
     @AppStorage(SettingsKey.autoExpandOnCompletion) private var autoExpandOnCompletion = SettingsDefaults.autoExpandOnCompletion
     @AppStorage(SettingsKey.pluginSessionMode) private var pluginSessionMode = SettingsDefaults.pluginSessionMode
+    @AppStorage(SettingsKey.copilotSubagentMode) private var copilotSubagentMode = SettingsDefaults.copilotSubagentMode
+    @AppStorage(SettingsKey.copilotPermissionMode) private var copilotPermissionMode = SettingsDefaults.copilotPermissionMode
     @AppStorage(SettingsKey.hapticOnHover) private var hapticOnHover = SettingsDefaults.hapticOnHover
     @AppStorage(SettingsKey.hapticIntensity) private var hapticIntensity = SettingsDefaults.hapticIntensity
     @AppStorage(SettingsKey.sessionTimeout) private var sessionTimeout = SettingsDefaults.sessionTimeout
@@ -367,6 +369,18 @@ private struct BehaviorPage: View {
                 guard pluginSessionMode != newMode else { return }
                 pluginSessionMode = newMode
                 appState?.applyCurrentPluginSessionMode()
+            }
+        )
+    }
+
+    private var copilotSubagentModeBinding: Binding<String> {
+        Binding(
+            get: { CopilotSubagentMode.normalizedRawValue(copilotSubagentMode) },
+            set: { newMode in
+                let normalized = CopilotSubagentMode.normalizedRawValue(newMode)
+                guard copilotSubagentMode != normalized else { return }
+                copilotSubagentMode = normalized
+                appState?.applyCurrentCopilotSubagentMode()
             }
         )
     }
@@ -437,6 +451,28 @@ private struct BehaviorPage: View {
                     }
                     .pickerStyle(.segmented)
                     .padding(.leading, 84)
+                }
+            }
+
+            Section(l10n["copilot_permission_mode"]) {
+                Picker(selection: $copilotPermissionMode) {
+                    ForEach(CopilotPermissionMode.allCases) { mode in
+                        Text(l10n["copilot_permission_mode_\(mode.rawValue)"]).tag(mode.rawValue)
+                    }
+                } label: {
+                    Text(l10n["copilot_permission_mode"])
+                    Text(l10n["copilot_permission_mode_desc"])
+                }
+            }
+
+            Section(l10n["copilot_subagent_mode"]) {
+                Picker(selection: copilotSubagentModeBinding) {
+                    ForEach(CopilotSubagentMode.allCases) { mode in
+                        Text(l10n["copilot_subagent_mode_\(mode.rawValue)"]).tag(mode.rawValue)
+                    }
+                } label: {
+                    Text(l10n["copilot_subagent_mode"])
+                    Text(l10n["copilot_subagent_mode_desc"])
                 }
             }
 

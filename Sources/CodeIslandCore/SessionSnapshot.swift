@@ -47,6 +47,7 @@ public struct SessionSnapshot: Sendable {
     public var status: AgentStatus = .idle
     public var currentTool: String?
     public var toolDescription: String?
+    public var waitingApprovalNeedsClearOnNextEvent = false
     public var lastActivity: Date = Date()
     public var cwd: String?
     public var model: String?
@@ -524,7 +525,9 @@ public enum SideEffect: Equatable {
 public func reduceEvent(
     sessions: inout [String: SessionSnapshot],
     event: HookEvent,
-    maxHistory: Int
+    maxHistory: Int,
+    showCopilotPermissionPromptNotifications: Bool = true,
+    replyCompletePlaceholder: String = "[Reply complete]"
 ) -> [SideEffect] {
     let sessionId = event.sessionId ?? "default"
     let eventName = EventNormalizer.normalize(event.eventName)
@@ -569,9 +572,19 @@ public func reduceEvent(
         if handled { return effects }
     }
 
+    let shouldConsumeHeadsUpWaitingApproval = sessions[sessionId]?.source == "copilot"
+        && sessions[sessionId]?.waitingApprovalNeedsClearOnNextEvent == true
+        && eventName != "Notification"
+    let shouldClearHeadsUpWaitingApproval = shouldConsumeHeadsUpWaitingApproval
+        && sessions[sessionId]?.status == .waitingApproval
+    if shouldConsumeHeadsUpWaitingApproval {
+        sessions[sessionId]?.waitingApprovalNeedsClearOnNextEvent = false
+    }
+
     // Preserve actionable states: don't let activity updates overwrite waiting states
-    let isWaiting = sessions[sessionId]?.status == .waitingApproval
-        || sessions[sessionId]?.status == .waitingQuestion
+    let isWaiting = (sessions[sessionId]?.status == .waitingApproval
+        || sessions[sessionId]?.status == .waitingQuestion)
+        && !shouldClearHeadsUpWaitingApproval
 
     // Update this session's state
     switch eventName {
@@ -678,7 +691,7 @@ public func reduceEvent(
             sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
         } else if sessions[sessionId]?.lastAssistantMessage == nil,
                   sessions[sessionId]?.recentMessages.last?.isUser == true {
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: "[回复完成]"))
+            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: replyCompletePlaceholder))
         }
         // Cline tasks are single-round — treat completion/cancellation as session end,
         // and latch a flag so out-of-order in-flight tool events don't revive it.
@@ -694,6 +707,10 @@ public func reduceEvent(
         sessions[sessionId]?.status = .idle
         sessions[sessionId]?.currentTool = nil
         sessions[sessionId]?.toolDescription = nil
+        if sessions[sessionId]?.source == "copilot" {
+            let subagents = sessions[sessionId]?.subagents ?? [:]
+            sessions[sessionId]?.subagents = subagents.filter { !$0.key.hasPrefix("toolu_") }
+        }
         let assistantMsg = firstStringFromEvent(
             event,
             keys: ["last_assistant_message", "text", "message", "summary"],
@@ -705,7 +722,7 @@ public func reduceEvent(
         } else if sessions[sessionId]?.lastAssistantMessage == nil,
                   sessions[sessionId]?.recentMessages.last?.isUser == true {
             // No reply content from hook (e.g. CodeBuddy) -- add placeholder
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: "[回复完成]"))
+            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: replyCompletePlaceholder))
         }
         // Try to capture user prompt from Stop event if not already set
         if sessions[sessionId]?.lastUserPrompt == nil {
@@ -779,15 +796,34 @@ public func reduceEvent(
         effects.append(.removeSession(sessionId: sessionId))
         return effects
     case "Notification":
+        let isCopilot = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String) == "copilot"
+        let notificationType = event.rawJSON["notification_type"] as? String
+        let suppressCopilotPermissionPrompt = isCopilot
+            && notificationType == "permission_prompt"
+            && !showCopilotPermissionPromptNotifications
         let notificationText = firstStringFromEvent(
             event,
             keys: ["message", "text", "summary", "status", "detail"],
             includeNested: true
         )
-        if let msg = notificationText, !msg.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
+        if !suppressCopilotPermissionPrompt,
+           let msg = notificationText,
+           !msg.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty {
             sessions[sessionId]?.toolDescription = msg
         }
-        if QuestionPayload.from(event: event) != nil {
+        if isCopilot, let notificationType {
+            switch notificationType {
+            case "elicitation_dialog":
+                sessions[sessionId]?.status = .waitingQuestion
+            case "permission_prompt":
+                if showCopilotPermissionPromptNotifications {
+                    sessions[sessionId]?.status = .waitingApproval
+                    sessions[sessionId]?.waitingApprovalNeedsClearOnNextEvent = true
+                }
+            default:
+                break
+            }
+        } else if QuestionPayload.from(event: event) != nil {
             sessions[sessionId]?.status = .waitingQuestion
         }
     case "PreCompact":

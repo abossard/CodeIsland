@@ -26,6 +26,227 @@ final class ConfigInstallerTests: XCTestCase {
         let hooks = try XCTUnwrap(hooksAny as? [Any], file: file, line: line)
         return hooks.compactMap { $0 as? [String: Any] }
     }
+
+    // MARK: - Copilot CLI support
+
+    func testCopilotEventNormalizerMapsCliEvents() {
+        let cases = [
+            ("permissionRequest", "PermissionRequest"),
+            ("notification", "Notification"),
+            ("agentStop", "Stop"),
+            ("postToolUseFailure", "PostToolUseFailure"),
+            ("unknownCopilotEvent", "unknownCopilotEvent"),
+        ]
+
+        for (input, expected) in cases {
+            XCTAssertEqual(EventNormalizer.normalize(input), expected, "Unexpected mapping for \(input)")
+        }
+    }
+
+    func testCopilotDefaultEventsIncludePermissionNotificationAndStopTimeouts() {
+        let expected = [
+            "sessionStart": 5,
+            "sessionEnd": 5,
+            "userPromptSubmitted": 5,
+            "preToolUse": 5,
+            "postToolUse": 5,
+            "errorOccurred": 5,
+            "permissionRequest": 86_400,
+            "notification": 86_400,
+            "agentStop": 5,
+            "postToolUseFailure": 5,
+        ]
+        let actual = Dictionary(uniqueKeysWithValues: ConfigInstaller.defaultEvents(for: .copilot).map { ($0.0, $0.1) })
+
+        XCTAssertEqual(actual.count, expected.count)
+        for (event, timeout) in expected {
+            XCTAssertEqual(actual[event], timeout, "Unexpected timeout for \(event)")
+        }
+    }
+
+    func testInstallCopilotHooksRendersAllManagedEventsWithTimeouts() throws {
+        let fm = FileManager.default
+        let root = projectScratchDirectory(named: "copilot-hooks")
+        try? fm.removeItem(at: root)
+        try fm.createDirectory(at: root.appendingPathComponent(".copilot", isDirectory: true), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        var cli = CLIConfig(
+            name: "Copilot",
+            source: "copilot",
+            configPath: ".copilot/hooks/codeisland.json",
+            configKey: "hooks",
+            format: .copilot,
+            events: ConfigInstaller.defaultEvents(for: .copilot)
+        )
+        cli.rootOverride = { root.path }
+
+        XCTAssertTrue(ConfigInstaller.installExternalHooks(cli: cli, fm: fm))
+
+        let data = try XCTUnwrap(fm.contents(atPath: root.appendingPathComponent(".copilot/hooks/codeisland.json").path))
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let hooks = try XCTUnwrap(json["hooks"] as? [String: [[String: Any]]])
+        let expectedTimeouts = [
+            "sessionStart": 5,
+            "sessionEnd": 5,
+            "userPromptSubmitted": 5,
+            "preToolUse": 5,
+            "postToolUse": 5,
+            "errorOccurred": 5,
+            "permissionRequest": 86_400,
+            "notification": 86_400,
+            "agentStop": 5,
+            "postToolUseFailure": 5,
+        ]
+
+        XCTAssertEqual(Set(hooks.keys), Set(expectedTimeouts.keys))
+        for (event, timeout) in expectedTimeouts {
+            let entry = try XCTUnwrap(hooks[event]?.first, "Missing hook entry for \(event)")
+            XCTAssertEqual(entry["timeoutSec"] as? Int, timeout, "Unexpected timeout for \(event)")
+            XCTAssertEqual(entry["type"] as? String, "command")
+            let bash = try XCTUnwrap(entry["bash"] as? String)
+            XCTAssertTrue(bash.contains("codeisland-bridge --source copilot"))
+            XCTAssertTrue(bash.contains("--event \(event)"))
+        }
+    }
+
+    func testCopilotResponseTranslationAllowsPermission() throws {
+        let data = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#.utf8)
+
+        let translated = HookServer.translateResponseForSource(data, source: "copilot")
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: translated) as? [String: Any])
+
+        XCTAssertEqual(json["behavior"] as? String, "allow")
+        XCTAssertNil(json["hookSpecificOutput"])
+    }
+
+    func testCopilotResponseTranslationDeniesPermissionWithMessage() throws {
+        let data = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"No network"}}}"#.utf8)
+
+        let translated = HookServer.translateResponseForSource(data, source: "copilot")
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: translated) as? [String: Any])
+
+        XCTAssertEqual(json["behavior"] as? String, "deny")
+        XCTAssertEqual(json["message"] as? String, "No network")
+    }
+
+    func testCopilotResponseTranslationAddsDefaultDenyMessage() throws {
+        let data = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny"}}}"#.utf8)
+
+        let translated = HookServer.translateResponseForSource(data, source: "copilot")
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: translated) as? [String: Any])
+
+        XCTAssertEqual(json["behavior"] as? String, "deny")
+        XCTAssertEqual(json["message"] as? String, "Denied by CodeIsland")
+    }
+
+    func testCopilotResponseTranslationMapsUpdatedInputToModifiedArgs() throws {
+        let data = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedInput":{"command":"pwd"}}}}"#.utf8)
+
+        let translated = HookServer.translateResponseForSource(data, source: "copilot")
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: translated) as? [String: Any])
+        let modifiedArgs = try XCTUnwrap(json["modifiedArgs"] as? [String: String])
+
+        XCTAssertEqual(json["behavior"] as? String, "allow")
+        XCTAssertEqual(modifiedArgs["command"], "pwd")
+    }
+
+    func testCopilotNotificationResponseTranslationReturnsEmptyObject() throws {
+        let data = Data(#"{"hookSpecificOutput":{"hookEventName":"Notification","answer":"React"}}"#.utf8)
+
+        let translated = HookServer.translateResponseForSource(data, source: "copilot")
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: translated) as? [String: Any])
+
+        XCTAssertTrue(json.isEmpty)
+        XCTAssertNil(json["additionalContext"])
+    }
+
+    func testCopilotElicitationNotificationSetsWaitingQuestionAndMessage() throws {
+        var session = SessionSnapshot()
+        session.source = "copilot"
+        session.status = .running
+        var sessions = ["copilot-session": session]
+        let event = try decodeHookEvent([
+            "hook_event_name": "notification",
+            "session_id": "copilot-session",
+            "_source": "copilot",
+            "notification_type": "elicitation_dialog",
+            "message": "Which framework?",
+        ])
+
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 10)
+
+        XCTAssertEqual(sessions["copilot-session"]?.status, .waitingQuestion)
+        XCTAssertEqual(sessions["copilot-session"]?.toolDescription, "Which framework?")
+    }
+
+    func testCopilotPermissionPromptNotificationSetsWaitingApprovalAndMessage() throws {
+        var session = SessionSnapshot()
+        session.source = "copilot"
+        session.status = .running
+        var sessions = ["copilot-session": session]
+        let event = try decodeHookEvent([
+            "hook_event_name": "notification",
+            "session_id": "copilot-session",
+            "_source": "copilot",
+            "notification_type": "permission_prompt",
+            "message": "Allow command?",
+        ])
+
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 10)
+
+        XCTAssertEqual(sessions["copilot-session"]?.status, .waitingApproval)
+        XCTAssertEqual(sessions["copilot-session"]?.toolDescription, "Allow command?")
+    }
+
+    func testCopilotOrdinaryNotificationKeepsRunningStatusAndUpdatesMessage() throws {
+        var session = SessionSnapshot()
+        session.source = "copilot"
+        session.status = .running
+        var sessions = ["copilot-session": session]
+        let event = try decodeHookEvent([
+            "hook_event_name": "notification",
+            "session_id": "copilot-session",
+            "_source": "copilot",
+            "notification_type": "agent_idle",
+            "message": "shell_completed: echo done",
+        ])
+
+        _ = reduceEvent(sessions: &sessions, event: event, maxHistory: 10)
+
+        XCTAssertEqual(sessions["copilot-session"]?.status, .running)
+        XCTAssertEqual(sessions["copilot-session"]?.toolDescription, "shell_completed: echo done")
+    }
+
+    func testCopilotResponseTranslationFallsBackToOriginalBytesOnMalformedJSON() {
+        let data = Data("not-json".utf8)
+
+        XCTAssertEqual(HookServer.translateResponseForSource(data, source: "copilot"), data)
+    }
+
+    func testResponseTranslationLeavesNonCopilotSourcesUntouched() {
+        let data = Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#.utf8)
+
+        XCTAssertEqual(HookServer.translateResponseForSource(data, source: "claude"), data)
+        XCTAssertEqual(HookServer.translateResponseForSource(data, source: nil), data)
+    }
+
+    private func decodeHookEvent(_ payload: [String: Any]) throws -> HookEvent {
+        let data = try JSONSerialization.data(withJSONObject: payload)
+        guard let event = HookEvent(from: data) else {
+            XCTFail("HookEvent should decode payload: \(payload)")
+            throw NSError(domain: "ConfigInstallerTests", code: 1)
+        }
+        return event
+    }
+
+    private func projectScratchDirectory(named name: String) -> URL {
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build", isDirectory: true)
+            .appendingPathComponent("test-workspaces", isDirectory: true)
+            .appendingPathComponent(name, isDirectory: true)
+    }
+
     func testRemoveManagedHookEntriesAlsoPrunesLegacyVibeIslandHooks() throws {
         let hooks: [String: Any] = [
             "SessionEnd": [

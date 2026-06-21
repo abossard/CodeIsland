@@ -21,6 +21,14 @@ struct ProcessIdentity: Equatable {
 @MainActor
 @Observable
 final class AppState {
+    static func autoApproveToolEntry(toolName: String, source rawSource: String?) -> String {
+        guard let source = SessionSnapshot.normalizedSupportedSource(rawSource) else {
+            log.warning("Always-allow auto-approve missing supported source for tool \(toolName, privacy: .public); storing legacy unnamespaced entry")
+            return toolName
+        }
+        return "\(source):\(toolName)"
+    }
+
     /// Snapshot of a hook event accepted by HookServer, kept for diagnostics
     /// export (#103). Stored in a fixed-size ring so we can attach the recent
     /// hook stream to bug reports without pulling in full payloads.
@@ -304,6 +312,12 @@ final class AppState {
     private nonisolated static func currentPluginSessionMode() -> String {
         UserDefaults.standard.string(forKey: SettingsKey.pluginSessionMode)
             ?? SettingsDefaults.pluginSessionMode
+    }
+
+    private nonisolated static func currentCopilotSubagentMode() -> String {
+        CopilotSubagentMode.normalizedRawValue(
+            UserDefaults.standard.string(forKey: SettingsKey.copilotSubagentMode)
+        )
     }
 
     // MARK: - Process Monitoring (DispatchSource)
@@ -928,7 +942,13 @@ final class AppState {
         cachePreToolUseIfApplicable(event)
         resolveToolUseIfCompleted(event)
 
-        let effects = reduceEvent(sessions: &sessions, event: event, maxHistory: maxHistory)
+        let effects = reduceEvent(
+            sessions: &sessions,
+            event: event,
+            maxHistory: maxHistory,
+            showCopilotPermissionPromptNotifications: SettingsManager.shared.copilotPermissionMode != .off,
+            replyCompletePlaceholder: L10n.shared["reply_complete_placeholder"]
+        )
 
         // Backfill model after metadata extraction. Hooks are inconsistent across providers,
         // so retry with a cooldown instead of giving up permanently on the first miss.
@@ -1100,6 +1120,18 @@ final class AppState {
         let responseData: Data
         if always, CodexPermissionRules.isCodexEvent(pending.event) {
             _ = CodexPermissionRules().persistAlwaysAllowRule(for: pending.event)
+            let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+            responseData = Data(response.utf8)
+        } else if always, SessionSnapshot.normalizedSupportedSource(pending.event.rawJSON["_source"] as? String) == "copilot" {
+            if let toolName = pending.event.toolName, !toolName.isEmpty {
+                let entry = Self.autoApproveToolEntry(toolName: toolName, source: pending.event.rawJSON["_source"] as? String)
+                var tools = SettingsManager.shared.autoApproveTools
+                tools.insert(entry)
+                SettingsManager.shared.autoApproveTools = tools
+                log.info("Persisted Copilot auto-approve tool entry \(entry, privacy: .public)")
+            } else {
+                log.warning("Copilot Always allow missing toolName; skipping auto-approve persistence")
+            }
             let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
             responseData = Data(response.utf8)
         } else if always {
@@ -1955,6 +1987,7 @@ final class AppState {
         }
         SessionPersistence.clear()
         _ = applyCodexSubsessionModeToKnownSessions()
+        _ = applyCopilotSubagentModeToKnownSessions()
         if activeSessionId == nil {
             activeSessionId = sessions.first(where: { $0.value.status != .idle })?.key
                 ?? sessions.keys.sorted().first
@@ -2261,6 +2294,9 @@ final class AppState {
         if applyCodexSubsessionModeToKnownSessions() {
             didMutate = true
         }
+        if applyCopilotSubagentModeToKnownSessions() {
+            didMutate = true
+        }
         if didMutate && activeSessionId == nil {
             activeSessionId = sessions.keys.sorted().first
         }
@@ -2341,6 +2377,62 @@ final class AppState {
         return didMutate
     }
 
+    @discardableResult
+    func applyCopilotSubagentModeToKnownSessions() -> Bool {
+        let mode = Self.currentCopilotSubagentMode()
+        guard mode == "hide" || mode == "merge" else {
+            return false
+        }
+
+        let candidates = sessions.map { (sessionId: $0.key, session: $0.value) }
+        var didMutate = false
+
+        for candidate in candidates
+            where SessionSnapshot.normalizedSupportedSource(candidate.session.source) == "copilot"
+                && candidate.sessionId.hasPrefix("toolu_") {
+            if sessions[candidate.sessionId] != nil {
+                removeSession(candidate.sessionId)
+                didMutate = true
+            }
+
+            guard mode == "merge",
+                  let childPid = candidate.session.cliPid,
+                  childPid > 0,
+                  let parentKey = findSessionId(
+                    forSource: "copilot",
+                    ppid: Int(childPid),
+                    excluding: candidate.sessionId
+                  ) else {
+                continue
+            }
+
+            let agentType = candidate.session.sessionTitle ?? "Copilot"
+            var subagent = sessions[parentKey]?.subagents[candidate.sessionId]
+                ?? SubagentState(agentId: candidate.sessionId, agentType: agentType)
+            subagent.status = candidate.session.status == .idle ? .running : candidate.session.status
+            subagent.currentTool = candidate.session.currentTool
+            subagent.toolDescription = candidate.session.toolDescription ?? candidate.session.sessionTitle
+            subagent.startTime = candidate.session.startTime
+            if candidate.session.lastActivity > subagent.lastActivity {
+                subagent.lastActivity = candidate.session.lastActivity
+            }
+            sessions[parentKey]?.subagents[candidate.sessionId] = subagent
+
+            if sessions[parentKey]?.status != .waitingApproval && sessions[parentKey]?.status != .waitingQuestion {
+                sessions[parentKey]?.status = .running
+                sessions[parentKey]?.currentTool = "Agent"
+                sessions[parentKey]?.toolDescription = subagent.toolDescription ?? agentType
+            }
+            if candidate.session.lastActivity > (sessions[parentKey]?.lastActivity ?? .distantPast) {
+                sessions[parentKey]?.lastActivity = candidate.session.lastActivity
+            }
+            activeSessionId = parentKey
+            didMutate = true
+        }
+
+        return didMutate
+    }
+
     func applyCurrentPluginSessionMode(persist: Bool = true) {
         let mode = Self.currentPluginSessionMode()
         var didMutate = false
@@ -2355,6 +2447,26 @@ final class AppState {
             didMutate = hideMergedCodexSubagents() || didMutate
         default:
             return
+        }
+
+        if didMutate {
+            if persist {
+                scheduleSave()
+                startRotationIfNeeded()
+            }
+            refreshDerivedState()
+        }
+    }
+
+    func applyCurrentCopilotSubagentMode(persist: Bool = true) {
+        let mode = Self.currentCopilotSubagentMode()
+        var didMutate = false
+
+        if mode == CopilotSubagentMode.hide.rawValue {
+            didMutate = applyCopilotSubagentModeToKnownSessions()
+            didMutate = hideMergedCopilotSubagents() || didMutate
+        } else {
+            didMutate = applyCopilotSubagentModeToKnownSessions()
         }
 
         if didMutate {
@@ -2440,6 +2552,17 @@ final class AppState {
     private func hideMergedCodexSubagents() -> Bool {
         var didMutate = false
         for (sessionId, session) in sessions where session.source == "codex" && !session.subagents.isEmpty {
+            sessions[sessionId]?.subagents.removeAll()
+            clearSubagentProjection(fromParentSession: sessionId)
+            didMutate = true
+        }
+        return didMutate
+    }
+
+    @discardableResult
+    private func hideMergedCopilotSubagents() -> Bool {
+        var didMutate = false
+        for (sessionId, session) in sessions where session.source == "copilot" && !session.subagents.isEmpty {
             sessions[sessionId]?.subagents.removeAll()
             clearSubagentProjection(fromParentSession: sessionId)
             didMutate = true

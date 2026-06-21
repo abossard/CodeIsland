@@ -13,6 +13,24 @@ class HookServer {
         case event
     }
 
+    enum PermissionRouteAction: Equatable {
+        case askUserQuestion
+        case autoApprove
+        case providerPassthrough
+        case intercept
+
+        var immediateResponse: Data? {
+            switch self {
+            case .autoApprove:
+                Data(#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#.utf8)
+            case .providerPassthrough:
+                Data("{}".utf8)
+            case .askUserQuestion, .intercept:
+                nil
+            }
+        }
+    }
+
     private let appState: AppState
     nonisolated static var socketPath: String { SocketPath.path }
     private var listener: NWListener?
@@ -119,6 +137,13 @@ class HookServer {
     /// Read from user settings; defaults to all known internal tools.
     private static var autoApproveTools: Set<String> {
         SettingsManager.shared.autoApproveTools
+    }
+
+    static func shouldAutoApprove(toolName: String, source: String?) -> Bool {
+        let tools = autoApproveTools
+        if tools.contains(toolName) { return true }
+        guard let source = SessionSnapshot.normalizedSupportedSource(source) else { return false }
+        return tools.contains("\(source):\(toolName)")
     }
 
     /// User-configured cwd substring blocklist for plugin/background hooks (e.g. claude-mem).
@@ -241,6 +266,48 @@ class HookServer {
         return .event
     }
 
+    nonisolated static func translateResponseForSource(_ data: Data, source: String?) -> Data {
+        guard SessionSnapshot.normalizedSupportedSource(source) == "copilot" else { return data }
+        return translateResponseForCopilot(data)
+    }
+
+    nonisolated private static func translateResponseForCopilot(_ data: Data) -> Data {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            log.warning("Copilot response translator: invalid JSON, passing through original bytes (\(data.count, privacy: .public) bytes)")
+            return data
+        }
+        guard let output = json["hookSpecificOutput"] as? [String: Any],
+              let hookEventName = output["hookEventName"] as? String else {
+            log.warning("Copilot response translator: missing hookSpecificOutput/hookEventName, passing through")
+            return data
+        }
+
+        let normalizedHookEventName = EventNormalizer.normalize(hookEventName)
+        switch normalizedHookEventName {
+        case "PermissionRequest":
+            guard let decision = output["decision"] as? [String: Any],
+                  let behavior = decision["behavior"] as? String else {
+                log.warning("Copilot response translator: PermissionRequest missing decision.behavior, passing through")
+                return data
+            }
+            var response: [String: Any] = ["behavior": behavior]
+            if behavior == "deny" {
+                response["message"] = (decision["message"] as? String) ?? "Denied by CodeIsland"
+            } else if let message = decision["message"] as? String {
+                response["message"] = message
+            }
+            if let updatedInput = decision["updatedInput"] {
+                response["modifiedArgs"] = updatedInput
+            }
+            return (try? JSONSerialization.data(withJSONObject: response)) ?? data
+        case "Notification":
+            return Data("{}".utf8)
+        default:
+            log.debug("Copilot response translator: no rule for hookEventName=\(normalizedHookEventName, privacy: .public), passing through")
+            return data
+        }
+    }
+
     nonisolated static func shouldDeferPermissionRequestToProvider(_ event: HookEvent) -> Bool {
         guard EventNormalizer.normalize(event.eventName) == "PermissionRequest",
               event.toolName != "AskUserQuestion" else {
@@ -249,9 +316,37 @@ class HookServer {
         return CodexPermissionRules.shouldDeferToCodexAutoReview(for: event)
     }
 
+    static func permissionRouteAction(
+        for event: HookEvent,
+        copilotPermissionMode: CopilotPermissionMode? = nil
+    ) -> PermissionRouteAction {
+        let copilotPermissionMode = copilotPermissionMode ?? SettingsManager.shared.copilotPermissionMode
+        if event.toolName == "AskUserQuestion" {
+            return .askUserQuestion
+        }
+
+        let source = SessionSnapshot.normalizedSupportedSource(event.rawJSON["_source"] as? String)
+        if source == "copilot", copilotPermissionMode != .intercept {
+            return .providerPassthrough
+        }
+
+        if let toolName = event.toolName,
+           Self.shouldAutoApprove(toolName: toolName, source: event.rawJSON["_source"] as? String) {
+            return .autoApprove
+        }
+
+        if Self.shouldDeferPermissionRequestToProvider(event) {
+            return .providerPassthrough
+        }
+
+        return .intercept
+    }
+
     private static let pluginMarkerBytes = Data("_via_plugin".utf8)
     private static let sourceMarkerBytes = Data(#""_source""#.utf8)
     private static let codexMarkerBytes = Data("codex".utf8)
+    private static let copilotMarkerBytes = Data("copilot".utf8)
+    private static let tooluMarkerBytes = Data("toolu_".utf8)
 
     private static func codexSubagentMetadata(from raw: [String: Any]) -> CodexSubagentMetadata? {
         guard let path = nonEmptyString(raw["transcript_path"]) else { return nil }
@@ -285,12 +380,65 @@ class HookServer {
         )
     }
 
-    private func routeSubsessionPayloadIfNeeded(data: Data) -> (processedData: Data, responseData: Data?) {
+    private func droppedCopilotSubagentResponse(childSessionId: String, ppid: Int?) -> (processedData: Data, responseData: Data?) {
+        let ppidDescription = ppid.map(String.init) ?? "missing"
+        log.warning("Dropping Copilot phantom subagent child=\(childSessionId, privacy: .public) source=copilot ppid=\(ppidDescription, privacy: .public) action={}")
+        return (Data("{}".utf8), Data("{}".utf8))
+    }
+
+    private func routeCopilotSubagentPayloadIfNeeded(raw: [String: Any], data: Data) -> (processedData: Data, responseData: Data?)? {
+        guard SessionSnapshot.normalizedSupportedSource(raw["_source"] as? String) == "copilot",
+              let childSessionId = Self.rawSessionId(from: raw),
+              childSessionId.hasPrefix("toolu_") else {
+            return nil
+        }
+
+        let mode = CopilotSubagentMode.normalizedRawValue(
+            UserDefaults.standard.string(forKey: SettingsKey.copilotSubagentMode)
+        )
+        if mode == CopilotSubagentMode.hide.rawValue {
+            return (data, Data("{}".utf8))
+        }
+
+        let ppid = Self.pluginPpid(from: raw)
+        guard let ppid,
+              let parentSessionId = appState.findSessionId(
+                forSource: "copilot",
+                ppid: ppid,
+                excluding: childSessionId
+               ) else {
+            return droppedCopilotSubagentResponse(childSessionId: childSessionId, ppid: ppid)
+        }
+
+        var rewritten = raw
+        rewritten["session_id"] = parentSessionId
+        rewritten["agent_id"] = Self.nonEmptyString(raw["agent_id"]) ?? childSessionId
+        rewritten["agent_type"] = Self.nonEmptyString(raw["agent_type"]) ?? "Copilot"
+        rewritten["_copilot_subagent"] = true
+        rewritten["_copilot_subagent_session_id"] = childSessionId
+        if let eventName = Self.rawEventName(from: raw) {
+            rewritten["_copilot_subagent_event"] = EventNormalizer.normalize(eventName)
+        }
+        guard let newData = try? JSONSerialization.data(withJSONObject: rewritten) else {
+            return droppedCopilotSubagentResponse(childSessionId: childSessionId, ppid: ppid)
+        }
+        return (newData, nil)
+    }
+
+    func routeSubsessionPayloadIfNeeded(data: Data) -> (processedData: Data, responseData: Data?) {
+        let hasSourceMarker = data.range(of: Self.sourceMarkerBytes) != nil
         let mayNeedRouting = data.range(of: Self.pluginMarkerBytes) != nil
-            || (data.range(of: Self.sourceMarkerBytes) != nil && data.range(of: Self.codexMarkerBytes) != nil)
+            || (hasSourceMarker && data.range(of: Self.codexMarkerBytes) != nil)
+            || (hasSourceMarker
+                && data.range(of: Self.copilotMarkerBytes) != nil
+                && data.range(of: Self.tooluMarkerBytes) != nil)
         guard mayNeedRouting,
               let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return (data, nil)
+        }
+
+        if let routed = routeCopilotSubagentPayloadIfNeeded(raw: raw, data: data) {
+            return routed
         }
 
         let mode = UserDefaults.standard.string(forKey: SettingsKey.pluginSessionMode)
@@ -356,8 +504,7 @@ class HookServer {
     private func processRequest(data: Data, connection: NWConnection) {
         // Sub-session mode pre-filter (#123, #151): events that arrived through a
         // plugin proxy (`_via_plugin`) or from a Codex native subagent can be
-        // merged into the matching main session, hidden, or kept separate per
-        // the user's setting. "separate" preserves prior behavior.
+        // merged into the matching main session or hidden per the user's setting.
         //
         // Cheap byte probes first — JSONSerialization on every PostToolUse on
         // the main thread is not free.
@@ -428,36 +575,29 @@ class HookServer {
         case .permission:
             let sessionId = event.sessionId ?? "default"
 
-            // Auto-approve safe internal tools without showing UI
-            if let toolName = event.toolName, Self.autoApproveTools.contains(toolName) {
-                let response = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
-                sendResponse(connection: connection, data: Data(response.utf8))
-                return
-            }
-
-            // AskUserQuestion is a question, not a permission — route to QuestionBar
-            if event.toolName == "AskUserQuestion" {
+            switch Self.permissionRouteAction(for: event) {
+            case .askUserQuestion:
                 monitorPeerDisconnect(connection: connection, sessionId: sessionId)
                 Task {
                     let responseBody = await withCheckedContinuation { continuation in
                         appState.handleAskUserQuestion(event, continuation: continuation)
                     }
-                    self.sendResponse(connection: connection, data: responseBody)
+                    self.sendResponse(connection: connection, data: responseBody, event: event)
                 }
-                return
-            }
-
-            if Self.shouldDeferPermissionRequestToProvider(event) {
-                sendResponse(connection: connection, data: Data("{}".utf8))
-                return
-            }
-
-            monitorPeerDisconnect(connection: connection, sessionId: sessionId)
-            Task {
-                let responseBody = await withCheckedContinuation { continuation in
-                    appState.handlePermissionRequest(event, continuation: continuation)
+            case .autoApprove:
+                if let response = PermissionRouteAction.autoApprove.immediateResponse {
+                    sendResponse(connection: connection, data: response, event: event)
                 }
-                self.sendResponse(connection: connection, data: responseBody)
+            case .providerPassthrough:
+                sendResponse(connection: connection, data: PermissionRouteAction.providerPassthrough.immediateResponse ?? Data("{}".utf8))
+            case .intercept:
+                monitorPeerDisconnect(connection: connection, sessionId: sessionId)
+                Task {
+                    let responseBody = await withCheckedContinuation { continuation in
+                        appState.handlePermissionRequest(event, continuation: continuation)
+                    }
+                    self.sendResponse(connection: connection, data: responseBody, event: event)
+                }
             }
 
         case .question:
@@ -467,7 +607,7 @@ class HookServer {
                 let responseBody = await withCheckedContinuation { continuation in
                     appState.handleQuestion(event, continuation: continuation)
                 }
-                self.sendResponse(connection: connection, data: responseBody)
+                self.sendResponse(connection: connection, data: responseBody, event: event)
             }
 
         case .event:
@@ -527,6 +667,13 @@ class HookServer {
                 }
             }
         }
+    }
+
+    private func sendResponse(connection: NWConnection, data: Data, event: HookEvent) {
+        sendResponse(
+            connection: connection,
+            data: Self.translateResponseForSource(data, source: event.rawJSON["_source"] as? String)
+        )
     }
 
     private func sendResponse(connection: NWConnection, data: Data) {

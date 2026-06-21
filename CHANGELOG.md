@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### English
+- Copilot CLI subagents (`task` tool spawns) no longer create phantom session rows in the notch panel. Their hook events arrive with sessionId `toolu_vrtx_*` (Anthropic tool_use_id, not a Copilot session_id) sharing the parent's PID; CodeIsland now merges them into the parent Copilot session via the same pattern used for Codex native subagents. New `copilotSubagentMode` setting (Behavior tab): `merge` (default) or `hide`. Legacy persisted `"separate"` normalizes to `"merge"`.
+- Configurable Copilot permission UX: new `copilotPermissionMode` setting (Behavior tab) with three modes — `intercept` (every `permissionRequest` opens the notch dialog, prior default), `headsUp` (default; pass-through to Copilot, show notch only when Copilot itself fires a `permission_prompt` notification), and `off` (no UI surface at all).
+- `SessionPersistence.load` drops `toolu_vrtx_*` rows on startup to clean up phantom sessions from prior builds.
+- GitHub Copilot CLI: full hook integration upgraded from 6 events to 10. Adds `permissionRequest` (allow/deny dialog in the notch panel — no more terminal prompt for "Do you want to run this command?"), `notification` (heads-up for `elicitation_dialog` → mascot alert + click-to-jump, and `permission_prompt` → waiting-approval state), `agentStop` (immediate idle transition — fixes mascot staying "running" until the 180/300 s fallback sweep), and `postToolUseFailure`.
+- Translate Copilot permission responses to Copilot's flat `{behavior, message}` shape (no Claude `hookSpecificOutput` wrapper).
+- Namespace per-CLI "Always allow" entries by source (`copilot:shell`, etc.) so a Copilot allow does not silently auto-approve the same tool name for Claude / Codex / Cursor. Legacy unnamespaced entries continue to match every source.
+- Warning logs on translator / adapter defensive branches (missing fields, unknown `notification_type`, Copilot Always-click without `toolName`) so silent pass-throughs surface in `os.log`.
+
+> Known: `swift test --filter 'Copilot|AppStatePermissionFlow'` hits a pre-existing SIGABRT in `AppStatePermissionFlowTests.testInteractiveDeliveryKeyChangesWhenApprovalDescriptionChanges` (ESP32 BLE test, unrelated to Copilot changes). Use the narrower `swift test --filter 'CopilotPermissionMode|CopilotSubagentMerge|ConfigInstaller'` to get a green Copilot-only signal.
+
+### 中文
+- Copilot CLI 子代理（`task` 工具产生）的事件不再在灵动岛中显示为重复的会话条目。它们的事件携带 `toolu_vrtx_*` 作为 sessionId（其实是 Anthropic 的 tool_use_id），与父进程同 PID；CodeIsland 现在沿用 Codex 子代理的合并模式把它们并入父 Copilot 会话。新增 `copilotSubagentMode` 设置（Behavior 标签）：`merge`（默认）或 `hide`。已存的 `"separate"` 自动归一为 `"merge"`。
+- 可配置的 Copilot 权限交互：新增 `copilotPermissionMode` 设置（Behavior 标签），三个模式 — `intercept`（每个 `permissionRequest` 都弹出灵动岛对话框，之前的默认）、`headsUp`（新默认；直接放行到 Copilot，只有 Copilot 自己触发 `permission_prompt` 通知时才显示等待状态）、`off`（完全不显示 UI）。
+- `SessionPersistence.load` 启动时清理掉历史构建残留的 `toolu_vrtx_*` 幻影会话行。
+- GitHub Copilot CLI：hook 集成从 6 个事件升级到 10 个。新增 `permissionRequest`（在灵动岛显示 allow/deny 对话框——不再需要终端里那个 "Do you want to run this command?"）、`notification`（`elicitation_dialog` → 吉祥物 alert + 点击跳转；`permission_prompt` → waiting-approval 状态）、`agentStop`（回话结束立即转 idle——修复吉祥物要等 180/300 秒 fallback 才回到 sleep）、`postToolUseFailure`。
+- 把 Copilot 的 permission 响应翻译成 Copilot 期望的扁平结构 `{behavior, message}`（不再用 Claude 的 `hookSpecificOutput` 包装）。
+- 按来源给"始终允许"的工具加命名空间（`copilot:shell` 等），避免 Copilot 上点一次 Always 就让 Claude / Codex / Cursor 的同名工具也被静默放行。已有的未命名空间条目仍然对所有来源生效。
+- 翻译器和适配器的防御分支补上 warning 级日志（字段缺失、未知 `notification_type`、Copilot Always 点击缺 `toolName`），让静默 pass-through 在 `os.log` 里可见。
+
+> 已知：`swift test --filter 'Copilot|AppStatePermissionFlow'` 会触发一个与本次改动无关的 ESP32 BLE 测试 SIGABRT（`testInteractiveDeliveryKeyChangesWhenApprovalDescriptionChanges`）。要获得只测 Copilot 的绿信号，请使用更窄的 `swift test --filter 'CopilotPermissionMode|CopilotSubagentMerge|ConfigInstaller'`。
+
 ## [v1.0.27] - 2026-05-30
 
 ### English

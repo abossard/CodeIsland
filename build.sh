@@ -145,23 +145,43 @@ build_mac() {
     fi
 
     echo "Code signing ($SIGN_ID)..."
+    # Decide whether to use the hardened runtime. Notarization requires it, but
+    # ad-hoc signing (SIGN_ID="-") + `--options runtime` + an embedded ad-hoc
+    # framework like Sparkle trips a dyld check on macOS 15+ that rejects
+    # frameworks whose Team ID differs from the host process — and "no Team ID"
+    # is treated as different from "no Team ID". Drop hardened runtime for
+    # ad-hoc builds so the local .app actually launches.
+    if [ "$SIGN_ID" = "-" ]; then
+        RUNTIME_FLAG=""
+    else
+        RUNTIME_FLAG="--options=runtime"
+    fi
+
     # Sign embedded frameworks first (inside-out).
     SPARKLE_FW="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
     # Sign nested helpers inside Sparkle before the framework itself.
     for xpc in "$SPARKLE_FW/Versions/B/XPCServices/"*.xpc; do
         [ -e "$xpc" ] || continue
-        codesign --force --options runtime --sign "$SIGN_ID" "$xpc"
+        codesign --force ${RUNTIME_FLAG:+$RUNTIME_FLAG} --sign "$SIGN_ID" "$xpc"
     done
     if [ -d "$SPARKLE_FW/Versions/B/Updater.app" ]; then
-        codesign --force --options runtime --sign "$SIGN_ID" "$SPARKLE_FW/Versions/B/Updater.app"
+        codesign --force ${RUNTIME_FLAG:+$RUNTIME_FLAG} --sign "$SIGN_ID" "$SPARKLE_FW/Versions/B/Updater.app"
     fi
     if [ -e "$SPARKLE_FW/Versions/B/Autoupdate" ]; then
-        codesign --force --options runtime --sign "$SIGN_ID" "$SPARKLE_FW/Versions/B/Autoupdate"
+        codesign --force ${RUNTIME_FLAG:+$RUNTIME_FLAG} --sign "$SIGN_ID" "$SPARKLE_FW/Versions/B/Autoupdate"
     fi
-    codesign --force --options runtime --sign "$SIGN_ID" "$SPARKLE_FW"
+    # Re-sign the Sparkle dylib itself before sealing the framework. SPM ships
+    # the artifact pre-signed with the Sparkle Project's Team ID — dyld then
+    # refuses to load it into a process signed with a different Team ID
+    # (or ad-hoc / no Team ID) under the hardened runtime. Forcing a fresh
+    # signature on the inner Mach-O makes the Team IDs match the host app.
+    if [ -e "$SPARKLE_FW/Versions/B/Sparkle" ]; then
+        codesign --force ${RUNTIME_FLAG:+$RUNTIME_FLAG} --sign "$SIGN_ID" "$SPARKLE_FW/Versions/B/Sparkle"
+    fi
+    codesign --force ${RUNTIME_FLAG:+$RUNTIME_FLAG} --sign "$SIGN_ID" "$SPARKLE_FW"
 
-    codesign --force --options runtime --sign "$SIGN_ID" "$APP_BUNDLE/Contents/Helpers/codeisland-bridge"
-    codesign --force --options runtime --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
+    codesign --force ${RUNTIME_FLAG:+$RUNTIME_FLAG} --sign "$SIGN_ID" "$APP_BUNDLE/Contents/Helpers/codeisland-bridge"
+    codesign --force ${RUNTIME_FLAG:+$RUNTIME_FLAG} --sign "$SIGN_ID" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
 
     if [ "$NOTARIZE" = true ] && [[ "$SIGN_ID" == *"Developer ID"* ]]; then
         echo "Creating ZIP for notarization..."

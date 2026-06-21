@@ -5,13 +5,16 @@ import CodeIslandCore
 @MainActor
 final class AppStatePermissionFlowTests: XCTestCase {
     private var savedCodexHome: String?
+    private var savedAutoApproveTools: Set<String> = []
 
     override func setUp() {
         super.setUp()
         savedCodexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
+        savedAutoApproveTools = SettingsManager.shared.autoApproveTools
     }
 
     override func tearDown() {
+        SettingsManager.shared.autoApproveTools = savedAutoApproveTools
         if let savedCodexHome {
             setenv("CODEX_HOME", savedCodexHome, 1)
         } else {
@@ -215,6 +218,148 @@ final class AppStatePermissionFlowTests: XCTestCase {
         XCTAssertNotEqual(first.joined(separator: "|"), second.joined(separator: "|"))
     }
 
+    func testCopilotAlwaysAllowPersistsAutoApproveToolOnlyForCopilot() async throws {
+        SettingsManager.shared.autoApproveTools = ["TaskList"]
+        let appState = AppState()
+        let copilotEvent = try makePermissionRequestEvent(
+            sessionId: "s-copilot-always-allow",
+            toolName: "shell",
+            source: "copilot"
+        )
+
+        let copilotResponseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(copilotEvent, continuation: continuation)
+            }
+        }
+
+        await Task.yield()
+        appState.approvePermission(always: true)
+
+        let copilotDecision = try extractPermissionDecision(from: await copilotResponseTask.value)
+        XCTAssertEqual(copilotDecision["behavior"] as? String, "allow")
+        XCTAssertNil(copilotDecision["updatedPermissions"])
+        XCTAssertEqual(SettingsManager.shared.autoApproveTools, ["TaskList", "copilot:shell"])
+
+        let claudeEvent = try makePermissionRequestEvent(
+            sessionId: "s-claude-always-allow",
+            toolName: "Bash"
+        )
+        let claudeResponseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(claudeEvent, continuation: continuation)
+            }
+        }
+
+        await Task.yield()
+        appState.approvePermission(always: true)
+
+        let claudeDecision = try extractPermissionDecision(from: await claudeResponseTask.value)
+        XCTAssertEqual(claudeDecision["behavior"] as? String, "allow")
+        XCTAssertNotNil(claudeDecision["updatedPermissions"])
+        XCTAssertFalse(SettingsManager.shared.autoApproveTools.contains("Bash"))
+    }
+
+    func testQueuedPermissionRequestStillBlocksToolEvents() async throws {
+        let appState = AppState()
+        let sessionId = "s-copilot-intercept"
+        let permission = try makePermissionRequestEvent(
+            sessionId: sessionId,
+            toolName: "Bash",
+            toolInput: [
+                "description": "Approve intercepted install",
+                "command": "npm install"
+            ],
+            source: "copilot"
+        )
+
+        let responseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(permission, continuation: continuation)
+            }
+        }
+
+        await Task.yield()
+        XCTAssertEqual(appState.permissionQueue.count, 1)
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .waitingApproval)
+        XCTAssertEqual(appState.sessions[sessionId]?.currentTool, "Bash")
+        XCTAssertEqual(appState.sessions[sessionId]?.toolDescription, "Approve intercepted install\nCommand:\nnpm install")
+
+        appState.handleEvent(try makeToolEvent(
+            name: "PreToolUse",
+            sessionId: sessionId,
+            toolName: "Bash",
+            toolInput: [
+                "description": "Later provider-owned command",
+                "command": "whoami"
+            ],
+            source: "copilot"
+        ))
+        appState.handleEvent(try makeToolEvent(
+            name: "PostToolUse",
+            sessionId: sessionId,
+            toolName: "Bash",
+            toolInput: ["command": "whoami"],
+            source: "copilot"
+        ))
+
+        XCTAssertEqual(appState.permissionQueue.count, 1)
+        XCTAssertEqual(appState.sessions[sessionId]?.status, .waitingApproval)
+        XCTAssertEqual(appState.sessions[sessionId]?.currentTool, "Bash")
+        XCTAssertEqual(appState.sessions[sessionId]?.toolDescription, "Approve intercepted install\nCommand:\nnpm install")
+        await assertTaskNotResolved(responseTask)
+
+        appState.approvePermission()
+        let response = await responseTask.value
+        XCTAssertEqual(try extractPermissionBehavior(from: response), "allow")
+        XCTAssertEqual(appState.permissionQueue.count, 0)
+    }
+
+    func testCopilotAlwaysAllowDoesNotLeakToClaudeAutoApprove() async throws {
+        SettingsManager.shared.autoApproveTools = []
+        let appState = AppState()
+        let copilotEvent = try makePermissionRequestEvent(
+            sessionId: "s-copilot-isolated-always-allow",
+            toolName: "shell",
+            source: "copilot"
+        )
+
+        let responseTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(copilotEvent, continuation: continuation)
+            }
+        }
+
+        await Task.yield()
+        appState.approvePermission(always: true)
+
+        let decision = try extractPermissionDecision(from: await responseTask.value)
+        XCTAssertEqual(decision["behavior"] as? String, "allow")
+        XCTAssertTrue(SettingsManager.shared.autoApproveTools.contains("copilot:shell"))
+        XCTAssertFalse(HookServer.shouldAutoApprove(toolName: "shell", source: "claude"))
+        XCTAssertFalse(HookServer.shouldAutoApprove(toolName: "shell", source: nil))
+        XCTAssertTrue(HookServer.shouldAutoApprove(toolName: "shell", source: "copilot"))
+    }
+
+    func testAutoApproveNamespacedEntriesDoNotLeakAndLegacyEntriesStillMatch() {
+        SettingsManager.shared.autoApproveTools = ["shell"]
+        XCTAssertTrue(HookServer.shouldAutoApprove(toolName: "shell", source: "copilot"))
+        XCTAssertTrue(HookServer.shouldAutoApprove(toolName: "shell", source: "claude"))
+        XCTAssertTrue(HookServer.shouldAutoApprove(toolName: "shell", source: nil))
+
+        SettingsManager.shared.autoApproveTools = ["copilot:shell"]
+        XCTAssertTrue(HookServer.shouldAutoApprove(toolName: "shell", source: "copilot"))
+        XCTAssertFalse(HookServer.shouldAutoApprove(toolName: "shell", source: "claude"))
+        XCTAssertFalse(HookServer.shouldAutoApprove(toolName: "shell", source: "codex"))
+        XCTAssertFalse(HookServer.shouldAutoApprove(toolName: "shell", source: nil))
+    }
+
+    func testAutoApproveToolEntryFallsBackToLegacyWhenSourceMissing() {
+        XCTAssertEqual(AppState.autoApproveToolEntry(toolName: "shell", source: nil), "shell")
+        XCTAssertEqual(AppState.autoApproveToolEntry(toolName: "shell", source: "unknown-cli"), "shell")
+        XCTAssertEqual(AppState.autoApproveToolEntry(toolName: "shell", source: "copilot"), "copilot:shell")
+    }
+
     func testCodexAlwaysAllowPersistsRuleWithoutUnsupportedUpdatedPermissions() async throws {
         let codexHome = makeTemporaryCodexHome()
         defer { try? FileManager.default.removeItem(at: codexHome) }
@@ -347,8 +492,24 @@ final class AppStatePermissionFlowTests: XCTestCase {
         toolInput: [String: Any] = ["command": "echo test"],
         source: String? = nil
     ) throws -> HookEvent {
+        try makeToolEvent(
+            name: "PermissionRequest",
+            sessionId: sessionId,
+            toolName: toolName,
+            toolInput: toolInput,
+            source: source
+        )
+    }
+
+    private func makeToolEvent(
+        name: String,
+        sessionId: String,
+        toolName: String,
+        toolInput: [String: Any],
+        source: String? = nil
+    ) throws -> HookEvent {
         var payload: [String: Any] = [
-            "hook_event_name": "PermissionRequest",
+            "hook_event_name": name,
             "session_id": sessionId,
             "tool_name": toolName,
             "tool_input": toolInput

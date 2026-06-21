@@ -39,7 +39,7 @@ enum SessionPersistence {
 
     static func save(_ sessions: [String: SessionSnapshot]) {
         let persisted: [PersistedSession] = sessions.compactMap { (id, s) in
-            guard !s.isRemote else { return nil }
+            guard !s.isRemote, !isToolUseSessionId(id) else { return nil }
             return PersistedSession(
                 sessionId: id,
                 cwd: s.cwd,
@@ -79,10 +79,19 @@ enum SessionPersistence {
     }
 
     static func load() -> [PersistedSession] {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: filePath)) else { return [] }
+        load(from: URL(fileURLWithPath: filePath))
+    }
+
+    static func load(from fileURL: URL) -> [PersistedSession] {
+        guard let data = try? Data(contentsOf: fileURL) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode([PersistedSession].self, from: data)) ?? []
+        let decoded = (try? decoder.decode([PersistedSession].self, from: data)) ?? []
+        return decoded.filter { !isToolUseSessionId($0.sessionId) }
+    }
+
+    private static func isToolUseSessionId(_ sessionId: String) -> Bool {
+        sessionId.hasPrefix("toolu_")
     }
 
     static func clear() {

@@ -341,6 +341,10 @@ struct ConfigInstaller {
                 ("preToolUse", 5, false),
                 ("postToolUse", 5, true),
                 ("errorOccurred", 5, true),
+                ("permissionRequest", 86400, false),
+                ("notification", 86400, true),
+                ("agentStop", 5, true),
+                ("postToolUseFailure", 5, true),
             ]
         ),
         // Kimi Code CLI — TOML hooks in ~/.kimi/config.toml
@@ -466,6 +470,10 @@ struct ConfigInstaller {
                 ("preToolUse", 5, false),
                 ("postToolUse", 5, true),
                 ("errorOccurred", 5, true),
+                ("permissionRequest", 86400, false),
+                ("notification", 86400, true),
+                ("agentStop", 5, true),
+                ("postToolUseFailure", 5, true),
             ]
         case .kimi:
             // Kimi Code CLI limits: max timeout 600, no PermissionRequest event
@@ -1092,7 +1100,7 @@ struct ConfigInstaller {
 
         if cli.format == .copilot {
             // Copilot: check root ~/.copilot exists, create hooks subdir if needed
-            let rootDir = NSHomeDirectory() + "/.copilot"
+            let rootDir = (cli.rootOverride?() ?? NSHomeDirectory()) + "/.copilot"
             guard fm.fileExists(atPath: rootDir) else { return true }
             if !fm.fileExists(atPath: cli.dirPath) {
                 try? fm.createDirectory(atPath: cli.dirPath, withIntermediateDirectories: true)

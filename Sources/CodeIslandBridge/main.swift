@@ -274,9 +274,13 @@ if sourceTag == "copilot" {
     if let toolName = json["toolName"] as? String {
         json["tool_name"] = toolName
     }
-    if let toolArgsStr = json["toolArgs"] as? String,
+    if json["tool_input"] == nil,
+       let toolArgsStr = json["toolArgs"] as? String,
        let argsData = toolArgsStr.data(using: .utf8),
        let argsObj = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] {
+        json["tool_input"] = argsObj
+    } else if json["tool_input"] == nil,
+              let argsObj = json["toolArgs"] as? [String: Any] {
         json["tool_input"] = argsObj
     }
 }
@@ -329,6 +333,11 @@ let cliPromoted = CLIProcessResolver.cliVariantOverride(
 let effectiveSource = cliPromoted ?? inferredSource
 if let source = effectiveSource {
     json["_source"] = source
+}
+if json["_source"] as? String == "copilot",
+   EventNormalizer.normalize(nonEmptyString(json["hook_event_name"]) ?? "") == "PermissionRequest",
+   nonEmptyString(json["tool_name"]) == nil {
+    debugLog("WARNING: Copilot permissionRequest missing toolName/tool_name; falling back without tool payload reshape")
 }
 // Mark events that arrived via a plugin proxy (no explicit --source but
 // ancestry inferred a real source — e.g. the omo OpenCode plugin firing
